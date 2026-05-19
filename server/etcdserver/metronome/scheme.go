@@ -131,3 +131,57 @@ func (s *Scheme) ShouldPersist(nodeID uint64, index uint64) bool {
 	}
 	return false
 }
+
+// ShouldFollowerPersistSnapshot reports whether nodeID — known to NOT
+// be the cluster's current leader — should locally persist the snapshot
+// at `index`. Used in the leader-always-saves snapshot scheme:
+//
+//   * The leader unconditionally saves its local snapshot (so it can
+//     always serve InstallSnapshot to recovering peers).
+//   * The remaining (K-1) of (N-1) followers rotate at each index,
+//     giving exactly K = f+1 cluster-wide saves per snapshot trigger
+//     (compared to N for canonical etcd, K average for the default
+//     full-rotation scheme).
+//
+// The rotation excludes leaderID from the candidate set. If leaderID
+// isn't in the scheme (impossible in steady state but possible during
+// term changes), the regular ShouldPersist is consulted as a fallback.
+func (s *Scheme) ShouldFollowerPersistSnapshot(nodeID, leaderID, index uint64) bool {
+	if s.quorumSize <= 1 {
+		// K=1 means only the leader saves; no follower is in any set.
+		return false
+	}
+	// Build the followers-only list, preserving sorted order.
+	followers := make([]uint64, 0, len(s.nodeIDs)-1)
+	leaderFound := false
+	for _, id := range s.nodeIDs {
+		if id == leaderID {
+			leaderFound = true
+			continue
+		}
+		followers = append(followers, id)
+	}
+	if !leaderFound {
+		// Leader not (yet) in this scheme's voter list — fall back to
+		// the default K-of-N rotation to keep durability invariant.
+		return s.ShouldPersist(nodeID, index)
+	}
+	if len(followers) == 0 {
+		return false
+	}
+	want := s.quorumSize - 1 // pick K-1 followers
+	if want <= 0 {
+		return false
+	}
+	if want > len(followers) {
+		want = len(followers)
+	}
+	m := len(followers)
+	start := int(index % uint64(m))
+	for i := 0; i < want; i++ {
+		if followers[(start+i)%m] == nodeID {
+			return true
+		}
+	}
+	return false
+}

@@ -776,43 +776,44 @@ func openWALFromSnapshot(cfg config.ServerConfig, snapshot *raftpb.Snapshot) (*w
 			ents      []raftpb.Entry
 		)
 		if cfg.Metronome {
-			// Metronome nodes have a sparse WAL: only entries where
-			// this node was in the rotating persist-set were fsynced.
-			// We never replay this sparse log on restart — that would
-			// require gap-fetching from peers, which adds complexity.
-			// Instead we rely on:
-			//   (a) the on-disk snapshot + HardState giving raft a
-			//       consistent starting state, and
-			//   (b) standard raft AppendEntries / MsgSnap catchup to
-			//       fill the gap from a live peer's in-memory raft log.
-			// ReadAllSparse is used only to tolerate the gaps while
-			// decoding the WAL file; we immediately discard `ents`.
+			// Metronome nodes have a sparse WAL + (under local-snap
+			// shuffling) possibly no local snap for some intervals.
+			// Recovery strategy:
+			//   * Discard sparse WAL entries (raft expects contiguous).
+			//   * Use whatever local snapshot we DO have as the
+			//     starting state (could be stale by ~K snapshot-counts
+			//     when we missed some persist-set rotations, or nil if
+			//     we never saved one).
+			//   * Clamp HardState.Commit down to the local snap index
+			//     (or 0 if no snap). raft.loadState requires
+			//     Commit ≤ lastIndex; without the clamp we panic.
+			//   * Raft then requests catch-up; the leader serves
+			//     MsgApp (if the gap is small enough to fit
+			//     SnapshotCatchUpEntries) or InstallSnapshot (the
+			//     standard mechanism — leader generates a fresh snap
+			//     from its live BBoltDB).
+			//
+			// Safety: every committed entry is durable on K = f+1
+			// metronome peers, so a quorum of any f+1 survivors
+			// collectively has the full committed log; HardState's
+			// Term/Vote are preserved so election safety is intact.
+			// The backend's consistent_index prevents double-apply
+			// of entries already applied before shutdown.
 			wmetadata, st, _, err = w.ReadAllSparse()
 			ents = nil
 
-			// With no entries loaded, raft's MemoryStorage exposes
-			// `lastIndex = snapshot.Index`. raft.loadState asserts
-			// `HardState.Commit ≤ lastIndex`, so we must clamp any
-			// Commit that races ahead of the on-disk snapshot —
-			// which happens when force-snapshot-on-shutdown lagged
-			// behind apply, or when the node crashed.
-			//
-			// Safety of clamping: every index in
-			//   (snapshot.Index, oldCommit]
-			// is durable on a quorum (K ≥ f+1) of metronome peers,
-			// so the leader will re-advance our Commit via MsgApp /
-			// MsgSnap after we start. Preserving HardState.Term and
-			// HardState.Vote keeps election safety intact. The
-			// backend's consistent_index is independent of this and
-			// prevents double-apply of entries we already applied
-			// before shutdown.
-			if snapshot != nil && st.Commit > snapshot.Metadata.Index {
+			var snapIdx uint64
+			if snapshot != nil {
+				snapIdx = snapshot.Metadata.Index
+			}
+			if st.Commit > snapIdx {
 				cfg.Logger.Info(
-					"metronome: clamping HardState.Commit to snapshot index",
+					"metronome: clamping HardState.Commit to local snap index",
 					zap.Uint64("old-commit", st.Commit),
-					zap.Uint64("snapshot-index", snapshot.Metadata.Index),
+					zap.Uint64("snapshot-index", snapIdx),
+					zap.Bool("has-local-snapshot", snapshot != nil),
 				)
-				st.Commit = snapshot.Metadata.Index
+				st.Commit = snapIdx
 			}
 		} else {
 			wmetadata, st, ents, err = w.ReadAll()
