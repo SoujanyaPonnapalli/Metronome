@@ -321,12 +321,10 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 				}
 
 				// Under metronome, filter entries so only nodes in the
-				// persist-set for each entry index WAL-write it. The
-				// leader always persists everything for simpler recovery.
+				// persist-set for each entry index WAL-write it.
 				// HardState is always passed through unchanged.
-				entsToSave := rd.Entries
-				if r.metronomeScheme != nil && !islead {
-					entsToSave = r.filterMetronomeEntries(rd.Entries)
+				entsToSave := r.entriesToPersist(rd.Entries, islead)
+				if r.metronomeScheme != nil {
 					r.recordReadySkipped(rd.HardState.Commit, rd.Entries, entsToSave)
 				}
 				// gofail: var raftBeforeSave struct{}
@@ -485,11 +483,14 @@ func (r *raftNode) processMessages(ms []raftpb.Message) []raftpb.Message {
 }
 
 // shouldPersistSnapshot decides whether this node should WAL-persist
-// the raft snapshot at the given index. Leaders always persist. Under
-// metronome, followers persist only if they are in the snapshot's
-// persist-set; when the scheme is disabled, all nodes persist.
-func (r *raftNode) shouldPersistSnapshot(islead bool, snapshotIndex uint64) bool {
-	if r.metronomeScheme == nil || islead {
+// the raft snapshot at the given index. Every node (leader included)
+// persists only if it is in the snapshot's persist-set; when the scheme
+// is disabled, all nodes persist.
+//
+// `islead` is retained in the signature for future role-aware policy
+// but is intentionally unused today.
+func (r *raftNode) shouldPersistSnapshot(_ bool, snapshotIndex uint64) bool {
+	if r.metronomeScheme == nil {
 		return true
 	}
 	scheme := r.currentScheme()
@@ -499,8 +500,30 @@ func (r *raftNode) shouldPersistSnapshot(islead bool, snapshotIndex uint64) bool
 	return scheme.ShouldPersist(r.localID, snapshotIndex)
 }
 
+// entriesToPersist decides which entries from a single Ready should be
+// fsynced on this node. It is the single seam the Ready loop consults
+// before calling storage.Save.
+//
+// In leader-shuffles metronome, every node (leader included) persists
+// only entries in its rotating persist-set. The leader's own commits
+// are acked from memory; followers' acks already work that way under
+// the canonical scheme. K-of-N copies on disk remain the safety
+// invariant, identical to the canonical scheme but distributed
+// uniformly across all N nodes.
+//
+// `islead` is retained in the signature for future role-aware policy
+// (e.g. an optional "leader always persists ConfChange" override) but
+// is intentionally unused today — see the leader_shuffles_test.go
+// suite for the contract.
+func (r *raftNode) entriesToPersist(ents []raftpb.Entry, _ bool) []raftpb.Entry {
+	if r.metronomeScheme == nil {
+		return ents
+	}
+	return r.filterMetronomeEntries(ents)
+}
+
 // filterMetronomeEntries returns the subset of entries that this
-// follower should WAL-persist under the active metronome scheme.
+// node should WAL-persist under the active metronome scheme.
 // Configuration-change entries (EntryConfChange, EntryConfChangeV2) are
 // always kept: membership transitions must be durable on every node so
 // the scheme can be reconstructed post-restart. When the node is in

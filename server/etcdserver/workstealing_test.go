@@ -37,7 +37,7 @@ func newTestRaftNode(t *testing.T, nodeID uint64, clusterIDs []uint64, wsTimeout
 		t.Fatalf("NewScheme: %v", err)
 	}
 	rs := raft.NewMemoryStorage()
-	return &raftNode{
+	rn := &raftNode{
 		lg: zap.NewNop(),
 		raftNodeConfig: raftNodeConfig{
 			lg:              zap.NewNop(),
@@ -48,6 +48,12 @@ func newTestRaftNode(t *testing.T, nodeID uint64, clusterIDs []uint64, wsTimeout
 			wsDuration:      wsDuration,
 		},
 	}
+	// The atomic schemeLive pointer is what currentScheme() reads. In
+	// production it's populated by the newRaftNode constructor; tests
+	// that build raftNode directly must seed it too, otherwise the
+	// filter sees scheme==nil and degenerates to "keep everything".
+	rn.metronomeSchemeLive.Store(scheme)
+	return rn
 }
 
 // seedMemoryStorage pushes contiguous dummy entries [from..to] into
