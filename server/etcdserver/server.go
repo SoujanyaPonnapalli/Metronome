@@ -905,6 +905,10 @@ func (s *EtcdServer) maybeForceShutdownSnapshot(ep *etcdProgress) {
 	lg.Info("metronome shutdown: forcing final snapshot",
 		zap.Uint64("applied-index", ep.appliedi),
 		zap.Uint64("disk-snapshot-index", ep.diskSnapshotIndex))
+	// Bypass the metronome persist-set rotation: shutdown-snap is the
+	// recovery anchor, so save unconditionally even if the rotation
+	// would have us skip this index.
+	s.forceDiskSnapshot = true
 	s.snapshot(ep, true /* toDisk */)
 }
 
@@ -2180,6 +2184,9 @@ func (s *EtcdServer) rebuildMetronomeSchemeIfEnabled() {
 func (s *EtcdServer) snapshot(ep *etcdProgress, toDisk bool) {
 	lg := s.Logger()
 	d := GetMembershipInfoInV2Format(lg, s.cluster)
+	// Capture forceDiskSnapshot here so the rotation-bypass decision
+	// below sees the original value; we reset it after capturing.
+	forced := s.forceDiskSnapshot
 	if toDisk {
 		s.Logger().Info(
 			"triggering snapshot",
@@ -2187,7 +2194,7 @@ func (s *EtcdServer) snapshot(ep *etcdProgress, toDisk bool) {
 			zap.Uint64("local-member-applied-index", ep.appliedi),
 			zap.Uint64("local-member-snapshot-index", ep.diskSnapshotIndex),
 			zap.Uint64("local-member-snapshot-count", s.Cfg.SnapshotCount),
-			zap.Bool("snapshot-forced", s.forceDiskSnapshot),
+			zap.Bool("snapshot-forced", forced),
 		)
 		s.forceDiskSnapshot = false
 		// commit kv to write metadata (for example: consistent index) to disk.
@@ -2217,38 +2224,37 @@ func (s *EtcdServer) snapshot(ep *etcdProgress, toDisk bool) {
 	verifyConsistentIndexIsLatest(snap, s.consistIndex.ConsistentIndex())
 
 	if toDisk {
-		// Metronome — local snapshot rotation:
-		//   * the LEADER always saves (so it can always serve
-		//     InstallSnapshot to a recovering follower),
-		//   * exactly (K-1) of (N-1) FOLLOWERS rotate as savers per
-		//     index, picked via ShouldFollowerPersistSnapshot.
+		// Metronome — local snapshot rotation. Every node (leader
+		// included) consults shouldPersistSnapshot. Exactly K of N
+		// nodes save per trigger, giving optimal (N-K)/N cluster-wide
+		// snap-byte savings (33% at N=3 K=2; 43% at N=7 K=4).
 		//
-		// Total cluster-wide saves per trigger: 1 + (K-1) = K = f+1
-		// (vs N canonical). Saves exactly (N-K)/N of cluster snap-byte
-		// traffic at zero recovery-protocol cost.
+		// EXCEPTION: when s.forceDiskSnapshot is set (graceful
+		// shutdown path, or any other "this snap is the recovery
+		// anchor" caller), bypass the rotation and save
+		// unconditionally. Without this a stopping node that happens
+		// to fall outside the persist-set at shutdown time exits with
+		// no fresh anchor — and on restart the only anchor is some
+		// older snap that's K snapshot-counts back, which makes the
+		// MsgApp catch-up too long for the test's 30-second window.
 		//
-		// A skipping follower:
+		// Why this works even when the LEADER skips its own local
+		// snap: the leader's snap-send path
+		// (createMergedSnapshotMessage in snapshot_merge.go) takes a
+		// FRESH snapshot from the live BBoltDB backend at send time
+		// (via s.be.Snapshot()) — it doesn't read from a saved
+		// .snap.db file. So the leader can always serve
+		// InstallSnapshot to a recovering follower regardless of
+		// which snap indices it chose to persist locally.
+		//
+		// A skipping node:
 		//   * skips SaveSnap (no .snap / .snap.db at this index),
 		//   * skips Release (keeps WAL retention until its own next
-		//     save anchors recovery),
+		//     save anchors local recovery),
 		//   * still advances ep.diskSnapshotIndex so the next trigger
-		//     fires snapshot-count entries from THIS index, not from
-		//     the last index where it happened to save.
-		// Followers use the same K-of-N rotation as for WAL entries.
-		// When the leader happens to fall in the rotation set for this
-		// snap index, the cluster saves K nodes; when it doesn't, the
-		// leader is force-saved and we get K+1 saves (over-saving by 1
-		// in 1/N of triggers). Average saves per trigger:
-		//   K + (N-K)/N · 1 = K · (1 + (N-K)/(N·K))   ≈ K + 1/N
-		// vs. canonical N. Disk savings (N - avg)/N:
-		//   N=3 K=2: 22%   N=5 K=3: 36%   N=7 K=4: 41%
-		// An exact-K-saves variant using a follower-only rotation was
-		// tried (and is logically cleaner) but ran into edge cases
-		// around the leader-id changing under load — savings gap is
-		// small and shrinks with N, so we accept the over-save here in
-		// exchange for stable test outcomes. Future work.
-		islead := s.isLeader()
-		persistLocally := islead || s.r.shouldPersistSnapshot(false, snap.Metadata.Index)
+		//     fires snapshot-count entries from THIS index.
+		persistLocally := forced ||
+			s.r.shouldPersistSnapshot(false, snap.Metadata.Index)
 		if persistLocally {
 			if err = s.r.storage.SaveSnap(snap); err != nil {
 				lg.Panic("failed to save snapshot", zap.Error(err))
@@ -2266,14 +2272,13 @@ func (s *EtcdServer) snapshot(ep *etcdProgress, toDisk bool) {
 			lg.Info(
 				"saved snapshot to disk",
 				zap.Uint64("snapshot-index", snap.Metadata.Index),
-				zap.Bool("is-leader", islead),
 			)
 		} else {
-			// Skipping follower: don't SaveSnap and don't Release.
-			// Keep WAL retention until our own next save provides a
-			// local recovery anchor.
+			// Skipping (could be leader or follower): don't SaveSnap
+			// and don't Release. Keep WAL retention until our own next
+			// save provides a local recovery anchor.
 			lg.Info(
-				"metronome: follower skipping local snapshot (not in persist-set)",
+				"metronome: skipping local snapshot (not in persist-set)",
 				zap.Uint64("snapshot-index", snap.Metadata.Index),
 				zap.String("local-member-id", s.MemberID().String()),
 			)
