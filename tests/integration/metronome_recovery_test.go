@@ -255,35 +255,41 @@ func TestLeaderShuffles_LeaderCrashRestart(t *testing.T) {
 // snapshot-count-triggered local snapshots are gated by the metronome
 // persist-set rotation, not written unconditionally on every node.
 //
-// Scenario:
-//   1. 3-node metronome cluster. snapshot-count=11 is chosen coprime
-//      to N=3 so that the trigger-index residues mod N cycle through
-//      all 3 classes — otherwise the deterministic rotation aliases
-//      every trigger to the same persist-set (a real concern; see
-//      AliasingNote at the bottom of this file).
-//   2. Drive ~250 puts → ~20 snapshot triggers, well-distributed
-//      across all 3 mod-N residue classes.
-//   3. Inspect each member's snap/ directory.
-//   4. Assert each member has a DIFFERENT snap-file set —
-//      i.e. the persist-set rotation is causing different nodes to
-//      skip different snapshots.
+// Table-driven across N ∈ {3, 5, 7} so we cover f ∈ {1, 2, 3} and
+// confirm the savings scale per K = f+1: expected saves per trigger =
+// K, cluster total ≈ K × T (vs N × T canonical).
 //
-// Without the local-snapshot gate every node writes every snapshot,
-// so all 3 sets are identical and the test fails.
+// snapshot-count=11 is coprime to all of {3,5,7} so trigger indices
+// cycle through all mod-N residue classes (otherwise the deterministic
+// rotation aliases every trigger to the same persist-set).
+//
+// Without the local-snapshot gate every node writes every snapshot, so
+// all sets are identical and the test fails.
 func TestLeaderShuffles_LocalSnapshotsAreShuffled(t *testing.T) {
+	for _, nNodes := range []int{3, 5, 7} {
+		t.Run(fmt.Sprintf("N=%d", nNodes), func(t *testing.T) {
+			testLocalSnapshotsAreShuffled(t, nNodes)
+		})
+	}
+}
+
+func testLocalSnapshotsAreShuffled(t *testing.T, nNodes int) {
 	integration.BeforeTest(t)
 
+	f := nNodes / 2
+	k := f + 1 // f+1 persist-set size (paper default)
+
 	clus := integration.NewCluster(t, &integration.ClusterConfig{
-		Size:          3,
+		Size:          nNodes,
 		Metronome:     true,
 		UseBridge:     true,
-		SnapshotCount: 11, // coprime to N=3
+		SnapshotCount: 11, // coprime to all of {3,5,7}
 	})
 	defer clus.Terminate(t)
 
 	cli, err := clus.ClusterClient(t)
 	require.NoError(t, err)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	const N = 250
@@ -294,12 +300,9 @@ func TestLeaderShuffles_LocalSnapshotsAreShuffled(t *testing.T) {
 	// Snapshots are async — wait briefly for the trailing trigger.
 	time.Sleep(2 * time.Second)
 
-	// Collect every member's .snap filename set (filename embeds term
-	// and index so each snapshot has a unique name).
 	type memberSnaps struct {
 		idx   int
 		files map[string]struct{}
-		dir   string
 	}
 	all := make([]memberSnaps, len(clus.Members))
 	for i, m := range clus.Members {
@@ -311,26 +314,19 @@ func TestLeaderShuffles_LocalSnapshotsAreShuffled(t *testing.T) {
 				set[e.Name()] = struct{}{}
 			}
 		}
-		all[i] = memberSnaps{idx: i, files: set, dir: snapDir}
-		names := make([]string, 0, len(set))
-		for n := range set {
-			names = append(names, n)
-		}
-		t.Logf("member %d (%s): %d .snap files: %v", i, snapDir, len(set), names)
+		all[i] = memberSnaps{idx: i, files: set}
+		t.Logf("  member %d: %d .snap files", i, len(set))
 	}
 
-	// Sanity: SOME node actually snapshotted (else local-snap path is
-	// dead). A specific node can legitimately have zero saves if every
-	// trigger aliased to a residue class excluding it — that's the
-	// rotation working, not a bug.
-	totalSnaps := 0
+	// Sanity: some node actually snapshotted.
+	total := 0
 	for _, ms := range all {
-		totalSnaps += len(ms.files)
+		total += len(ms.files)
 	}
-	require.Greater(t, totalSnaps, 0,
-		"no node has any .snap files — snapshotting didn't happen at all")
+	require.Greater(t, total, 0, "no node has any .snap files — snapshotting didn't happen")
 
-	// Sets must differ (rotation is working).
+	// Property: at least one pair of members has different sets
+	// (rotation is working, not "every node persists everything").
 	allEqual := true
 	for i := 1; i < len(all); i++ {
 		if !setsEqual(all[0].files, all[i].files) {
@@ -339,21 +335,12 @@ func TestLeaderShuffles_LocalSnapshotsAreShuffled(t *testing.T) {
 		}
 	}
 	if allEqual {
-		t.Errorf("all 3 nodes have identical local-snapshot file sets — " +
-			"local snapshots are NOT being shuffled by the metronome persist-set")
+		t.Errorf("N=%d: all nodes have identical local-snapshot file sets — rotation not working", nNodes)
 		return
 	}
 
-	// CLUSTER-LEVEL SAVINGS — the headline property. Without local-snap
-	// shuffling the cluster writes 3 × T snap files where T is the
-	// number of snapshot triggers. With K=2 of N=3 rotation each
-	// trigger has exactly K=2 of N=3 nodes saving, so cluster total
-	// should be ~(K/N) × 3 × T = K × T = (2/3) of canonical.
-	//
-	// We don't know T exactly (depends on commit timing), but we can
-	// compute T = |union(snap sets)| (every trigger's persist-set has
-	// at least one node IN the set, so the union covers all triggers).
-	// Then: cluster_writes = sum(|node|) should be ≤ K * T + tolerance.
+	// Cluster-level savings: T = |union| is the trigger count, and
+	// cluster total saves should be ≤ K × T + tolerance.
 	union := make(map[string]struct{})
 	clusterWrites := 0
 	for _, ms := range all {
@@ -363,19 +350,23 @@ func TestLeaderShuffles_LocalSnapshotsAreShuffled(t *testing.T) {
 		}
 	}
 	T := len(union)
-	const N_NODES = 3
-	const K_PERSIST = 2 // f+1
-	expectedCanonical := N_NODES * T
-	expectedShuffled := K_PERSIST * T
-	t.Logf("cluster total snap writes: %d (canonical would be %d, shuffled target %d, triggers T=%d)",
-		clusterWrites, expectedCanonical, expectedShuffled, T)
+	expectedCanonical := nNodes * T
+	expectedShuffled := k * T
+	t.Logf("  N=%d K=%d triggers=%d  cluster saves: %d  (canonical %d, target %d)  savings %.0f%%",
+		nNodes, k, T, clusterWrites, expectedCanonical, expectedShuffled,
+		float64(expectedCanonical-clusterWrites)/float64(expectedCanonical)*100)
 
-	// Tolerance: allow up to +1 per node (race between trigger ordering
-	// and persist-set evaluation).
-	if clusterWrites > expectedShuffled+N_NODES {
-		t.Errorf("cluster wrote %d snap files — expected ~%d under K=%d/N=%d rotation. "+
-			"Looks like each node is still saving every snapshot (no cluster-level savings).",
-			clusterWrites, expectedShuffled, K_PERSIST, N_NODES)
+	// Upper bound: cluster total ≤ K × T + tolerance for graceful-
+	// shutdown forced saves.
+	if clusterWrites > expectedShuffled+nNodes {
+		t.Errorf("N=%d K=%d: cluster wrote %d snap files — expected ≤ %d under rotation; "+
+			"looks like saves are not being gated", nNodes, k, clusterWrites, expectedShuffled+nNodes)
+	}
+	// Lower-bound sanity: must be strictly less than the canonical
+	// no-rotation case (where every node saves every snap).
+	if clusterWrites >= expectedCanonical {
+		t.Errorf("N=%d: cluster wrote %d (>= canonical %d); rotation has zero effect",
+			nNodes, clusterWrites, expectedCanonical)
 	}
 }
 
