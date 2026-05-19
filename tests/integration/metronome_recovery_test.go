@@ -169,6 +169,86 @@ func TestMetronomeCrashRestart(t *testing.T) {
 	}, 30*time.Second, 200*time.Millisecond, "restarted follower did not catch up")
 }
 
+// TestLeaderShuffles_LeaderCrashRestart is the recovery-safety test for
+// the leader-shuffles patch. The canonical metronome scheme had the
+// leader persist every entry, so leader-crash recovery was a non-issue
+// (its WAL was dense). After PR-1+PR-2 the leader also writes a sparse
+// WAL, and we must verify that the existing recovery path — discard
+// sparse WAL on restart + standard raft catch-up from peers — is
+// leader-symmetric.
+//
+// Scenario:
+//   1. 3-node metronome cluster, low snapshot-count to keep recovery
+//      on the MsgApp catch-up path (not InstallSnapshot).
+//   2. Drive N writes; identify the leader.
+//   3. STOP THE LEADER (the new piece; existing tests stop a follower).
+//   4. Continue writing — a new leader is elected from the f+1 = 2
+//      survivors. The old leader's last-known commit is now behind.
+//   5. Restart the old leader. Its on-disk WAL is sparse (every K/N
+//      entry up to the moment it crashed). Recovery: WAL discarded,
+//      HardState.Commit clamped to local snapshot index, catch-up via
+//      MsgApp from the new leader.
+//   6. Assert the restarted ex-leader eventually serves the latest key.
+func TestLeaderShuffles_LeaderCrashRestart(t *testing.T) {
+	integration.BeforeTest(t)
+
+	clus := integration.NewCluster(t, &integration.ClusterConfig{
+		Size:          3,
+		Metronome:     true,
+		UseBridge:     true,
+		SnapshotCount: 50,
+	})
+	defer clus.Terminate(t)
+
+	cli, err := clus.ClusterClient(t)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const N = 200
+	for i := 0; i < N; i++ {
+		_, perr := cli.Put(ctx, fmt.Sprintf("k-%04d", i), fmt.Sprintf("v-%04d", i))
+		require.NoError(t, perr)
+	}
+
+	leaderIdx := clus.WaitLeader(t)
+	oldLeader := clus.Members[leaderIdx]
+	survivors := make([]*integration.Member, 0, len(clus.Members)-1)
+	for i, m := range clus.Members {
+		if i != leaderIdx {
+			survivors = append(survivors, m)
+		}
+	}
+
+	oldLeader.Stop(t) // the change vs TestMetronomeCrashRestart
+	// Wait for the survivors to elect a new leader among themselves
+	// before sending more writes. Without this, Puts race the election
+	// and time out with "previous leader failure".
+	clus.WaitMembersForLeader(t, survivors)
+
+	for i := N; i < N+100; i++ {
+		_, perr := cli.Put(ctx, fmt.Sprintf("k-%04d", i), fmt.Sprintf("v-%04d", i))
+		require.NoError(t, perr)
+	}
+	require.NoError(t, oldLeader.Restart(t))
+
+	// Old leader must catch up — even though its sparse on-disk WAL
+	// has gaps the canonical commit's WAL replay logic happily handles
+	// (ReadAllSparse + discard).
+	require.Eventually(t, func() bool {
+		cli2, cerr := integration.NewClientV3(oldLeader)
+		if cerr != nil {
+			return false
+		}
+		defer cli2.Close()
+		kctx, kcancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer kcancel()
+		resp, gerr := cli2.Get(kctx, fmt.Sprintf("k-%04d", N+99), clientv3.WithSerializable())
+		return gerr == nil && len(resp.Kvs) == 1 &&
+			string(resp.Kvs[0].Value) == fmt.Sprintf("v-%04d", N+99)
+	}, 30*time.Second, 200*time.Millisecond, "restarted ex-leader did not catch up")
+}
+
 // TestMetronomeRecovery7Nodes3Crashed exercises the N=7, f=3 scenario.
 // The three stopped followers are stopped at different points in the
 // write stream, so each ends up at a different local snapshot index.
