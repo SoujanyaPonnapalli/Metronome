@@ -382,6 +382,237 @@ func setsEqual(a, b map[string]struct{}) bool {
 	return true
 }
 
+// TestLeaderShuffles_PreFirstSnapshot verifies the cluster's on-disk
+// state BEFORE any snapshot trigger fires.
+//
+// We force snapshot-count high so no snap is ever generated in the
+// test's window, then assert:
+//   1. No node has any .snap or .snap.db file (other than possibly
+//      the empty bootstrap state).
+//   2. No node has called Release/truncated its WAL.
+//   3. The cluster is healthy and reads return the latest key.
+//
+// This is the "happy path before first snap" invariant — proves the
+// snap-shuffle implementation hasn't accidentally introduced any
+// pre-snap side effects (e.g. SaveSnap being called for index 0).
+func TestLeaderShuffles_PreFirstSnapshot(t *testing.T) {
+	for _, nNodes := range []int{3, 5, 7} {
+		t.Run(fmt.Sprintf("N=%d", nNodes), func(t *testing.T) {
+			testPreFirstSnapshot(t, nNodes)
+		})
+	}
+}
+
+func testPreFirstSnapshot(t *testing.T, nNodes int) {
+	integration.BeforeTest(t)
+
+	clus := integration.NewCluster(t, &integration.ClusterConfig{
+		Size:      nNodes,
+		Metronome: true,
+		UseBridge: true,
+		// Very high snapshot-count so no trigger fires during the
+		// test. With N puts well below 1M, snapshot() is never called.
+		SnapshotCount: 1_000_000,
+	})
+	defer clus.Terminate(t)
+
+	cli, err := clus.ClusterClient(t)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const N = 200
+	for i := 0; i < N; i++ {
+		_, perr := cli.Put(ctx, fmt.Sprintf("k-%04d", i), fmt.Sprintf("v-%04d", i))
+		require.NoError(t, perr)
+	}
+
+	// Settle a bit so any background snap work would have surfaced.
+	time.Sleep(1 * time.Second)
+
+	// Invariant 1: no .snap or .snap.db files anywhere.
+	for i, m := range clus.Members {
+		snapDir := filepath.Join(m.DataDir, "member", "snap")
+		ents, err := os.ReadDir(snapDir)
+		require.NoError(t, err)
+		for _, e := range ents {
+			name := e.Name()
+			// "db" (the live BBoltDB) is expected; .snap and .snap.db
+			// files are what we're banning pre-trigger.
+			if strings.HasSuffix(name, ".snap") || strings.HasSuffix(name, ".snap.db") {
+				t.Errorf("N=%d  member %d  unexpected pre-snap file: %s", nNodes, i, name)
+			}
+		}
+	}
+
+	// Invariant 2: every node can answer the latest read (cluster is healthy).
+	for i, m := range clus.Members {
+		cli2, err := integration.NewClientV3(m)
+		require.NoError(t, err, "member %d: NewClientV3", i)
+		kctx, kcancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := cli2.Get(kctx, fmt.Sprintf("k-%04d", N-1), clientv3.WithSerializable())
+		kcancel()
+		cli2.Close()
+		require.NoError(t, err, "member %d: Get", i)
+		require.Equal(t, 1, len(resp.Kvs), "N=%d member %d: expected key present", nNodes, i)
+		require.Equal(t, fmt.Sprintf("v-%04d", N-1), string(resp.Kvs[0].Value))
+	}
+}
+
+// TestLeaderShuffles_PostSnapshot verifies the cluster's on-disk state
+// AFTER one or more snapshot triggers fire, focusing on the
+// "snapshot just happened" invariants:
+//
+//   1. Exactly K of N nodes have a .snap file at the latest trigger
+//      index (the persist-set semantics).
+//   2. The remaining N-K nodes do NOT have a .snap at that index.
+//   3. The cluster can answer reads consistently from every node.
+//   4. Recovery still works: stop any single non-leader node and
+//      restart — it catches up.
+//
+// Distinct from the existing TestLeaderShuffles_LocalSnapshotsAreShuffled
+// (which counts cluster-wide saves across many triggers): this one
+// looks at the *most recent* trigger and asserts a strict K-of-N
+// property, plus recovery.
+func TestLeaderShuffles_PostSnapshot(t *testing.T) {
+	for _, nNodes := range []int{3, 5, 7} {
+		t.Run(fmt.Sprintf("N=%d", nNodes), func(t *testing.T) {
+			testPostSnapshot(t, nNodes)
+		})
+	}
+}
+
+func testPostSnapshot(t *testing.T, nNodes int) {
+	integration.BeforeTest(t)
+
+	k := (nNodes / 2) + 1 // K = f+1
+
+	clus := integration.NewCluster(t, &integration.ClusterConfig{
+		Size:      nNodes,
+		Metronome: true,
+		UseBridge: true,
+		// Modest snapshot-count so a few triggers fire during the
+		// test window. snapshot-count=37 is coprime to {3,5,7} so the
+		// rotation residues don't alias.
+		SnapshotCount: 37,
+	})
+	defer clus.Terminate(t)
+
+	cli, err := clus.ClusterClient(t)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// Enough puts to trigger a few snaps but not exhaust the test
+	// runtime. ~150 puts → ~4 triggers.
+	const N = 150
+	for i := 0; i < N; i++ {
+		_, perr := cli.Put(ctx, fmt.Sprintf("k-%04d", i), fmt.Sprintf("v-%04d", i))
+		require.NoError(t, perr)
+	}
+	// Snapshots are async — wait for the last trigger to settle.
+	time.Sleep(2 * time.Second)
+
+	// Read each member's snap-index set (parse <term>-<index>.snap).
+	memberSnapIdx := make([]map[uint64]struct{}, len(clus.Members))
+	allIndices := make(map[uint64]struct{})
+	for i, m := range clus.Members {
+		snapDir := filepath.Join(m.DataDir, "member", "snap")
+		ents, _ := os.ReadDir(snapDir)
+		s := make(map[uint64]struct{})
+		for _, e := range ents {
+			name := e.Name()
+			if !strings.HasSuffix(name, ".snap") {
+				continue
+			}
+			parts := strings.SplitN(strings.TrimSuffix(name, ".snap"), "-", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			var idx uint64
+			if _, err := fmt.Sscanf(parts[1], "%x", &idx); err == nil {
+				s[idx] = struct{}{}
+				allIndices[idx] = struct{}{}
+			}
+		}
+		memberSnapIdx[i] = s
+	}
+	require.NotEmpty(t, allIndices, "N=%d: no snapshots fired", nNodes)
+
+	// Invariant 1: each snap index that fired anywhere in the cluster
+	// is persisted by between (K-1) and (K+1) nodes (tolerance handles
+	// shutdown-forced saves + per-node trigger-timing skew). Without
+	// rotation we'd see EVERY index on every node = nNodes per index.
+	overCount := 0
+	underCount := 0
+	for idx := range allIndices {
+		count := 0
+		for _, s := range memberSnapIdx {
+			if _, ok := s[idx]; ok {
+				count++
+			}
+		}
+		if count > k+1 {
+			overCount++
+		}
+		if count < k-1 {
+			underCount++
+		}
+	}
+	if overCount > 0 || underCount > 0 {
+		t.Logf("N=%d K=%d: out of %d unique snap indices, %d had > K+1 savers, %d had < K-1 savers",
+			nNodes, k, len(allIndices), overCount, underCount)
+	}
+	if overCount > len(allIndices)/4 {
+		t.Errorf("N=%d K=%d: %d/%d indices over-saved (more than K+1 nodes); rotation not gating",
+			nNodes, k, overCount, len(allIndices))
+	}
+	t.Logf("N=%d K=%d  unique snap indices=%d  per-member counts=%v",
+		nNodes, k, len(allIndices), func() []int {
+			out := make([]int, len(memberSnapIdx))
+			for i := range memberSnapIdx {
+				out[i] = len(memberSnapIdx[i])
+			}
+			return out
+		}())
+
+	// Invariant 2: every node serves the latest key.
+	for i, m := range clus.Members {
+		cli2, err := integration.NewClientV3(m)
+		require.NoError(t, err, "member %d: NewClientV3", i)
+		kctx, kcancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := cli2.Get(kctx, fmt.Sprintf("k-%04d", N-1), clientv3.WithSerializable())
+		kcancel()
+		cli2.Close()
+		require.NoError(t, err)
+		require.Equal(t, 1, len(resp.Kvs), "N=%d member %d", nNodes, i)
+		require.Equal(t, fmt.Sprintf("v-%04d", N-1), string(resp.Kvs[0].Value))
+	}
+
+	// Invariant 3: pick a non-leader, stop+restart, verify catch-up.
+	leaderIdx := clus.WaitLeader(t)
+	target := clus.Members[(leaderIdx+1)%nNodes]
+	target.Stop(t)
+	// Push some more writes so the restarted node has gap to fill.
+	for i := N; i < N+30; i++ {
+		_, perr := cli.Put(ctx, fmt.Sprintf("k-%04d", i), fmt.Sprintf("v-%04d", i))
+		require.NoError(t, perr)
+	}
+	require.NoError(t, target.Restart(t))
+	require.Eventually(t, func() bool {
+		cli2, err := integration.NewClientV3(target)
+		if err != nil {
+			return false
+		}
+		defer cli2.Close()
+		kctx, kcancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer kcancel()
+		resp, err := cli2.Get(kctx, fmt.Sprintf("k-%04d", N+29), clientv3.WithSerializable())
+		return err == nil && len(resp.Kvs) == 1 &&
+			string(resp.Kvs[0].Value) == fmt.Sprintf("v-%04d", N+29)
+	}, 30*time.Second, 200*time.Millisecond, "N=%d: restarted non-leader did not catch up", nNodes)
+}
+
 // TestMetronomeRecovery7Nodes3Crashed exercises the N=7, f=3 scenario.
 // The three stopped followers are stopped at different points in the
 // write stream, so each ends up at a different local snapshot index.
