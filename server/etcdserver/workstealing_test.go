@@ -241,8 +241,8 @@ func TestMaybeTriggerWorkSteal_ExitsAfterDuration(t *testing.T) {
 
 func TestFilterMetronomeEntries_PassthroughInWSMode(t *testing.T) {
 	rn := newTestRaftNode(t, 2, []uint64{1, 2, 3}, 1*time.Millisecond, time.Second)
-	// Force WS mode.
-	rn.wsActiveUntil = time.Now().Add(5 * time.Second)
+	// Force WS mode (helper keeps the atomic mirror in sync).
+	rn.setWSActiveUntil(time.Now().Add(5 * time.Second))
 
 	all := entries(10, 15)
 	got := rn.filterMetronomeEntries(all)

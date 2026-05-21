@@ -160,6 +160,18 @@ type raftNodeConfig struct {
 	wsActiveUntil time.Time // non-zero until this time => persist everything
 	wsTimeout     time.Duration
 	wsDuration    time.Duration
+
+	// wsActiveUntilNanos mirrors wsActiveUntil as UnixNano so the
+	// "are we in WS mode?" check can be lock-free on the hot path
+	// (filterMetronomeEntries is called once per Ready). 0 means
+	// inactive. Writes happen under wsMu *and* via atomic Store; reads
+	// outside wsMu must go through Load.
+	wsActiveUntilNanos atomic.Int64
+
+	// filterBuf is a reusable backing slice for filterMetronomeEntries
+	// to avoid per-Ready allocation. Single-goroutine access from the
+	// Ready loop, so no synchronisation needed.
+	filterBuf []raftpb.Entry
 }
 
 func newRaftNode(cfg raftNodeConfig) *raftNode {
@@ -530,6 +542,13 @@ func (r *raftNode) entriesToPersist(ents []raftpb.Entry, _ bool) []raftpb.Entry 
 // work-stealing mode (after recent straggler-driven timeout), ALL
 // entries are kept regardless of the scheme — strictly stronger than
 // the scheme's K-of-N guarantee, so safety is preserved.
+//
+// Hot path. The Ready loop calls this once per iteration with
+// (typically) 1–50 entries. We:
+//   - early-return when nothing to filter, before any atomic loads;
+//   - read the work-steal flag lock-free via wsActiveUntilNanos;
+//   - reuse a node-local buffer (filterBuf) for the output to avoid
+//     per-Ready allocation.
 func (r *raftNode) filterMetronomeEntries(ents []raftpb.Entry) []raftpb.Entry {
 	if len(ents) == 0 {
 		return ents
@@ -541,7 +560,11 @@ func (r *raftNode) filterMetronomeEntries(ents []raftpb.Entry) []raftpb.Entry {
 	if scheme == nil {
 		return ents // scheme not set yet; fall back to persist-all
 	}
-	out := ents[:0:0] // don't mutate caller's slice
+	// Reuse the per-node buffer; reset length, keep capacity.
+	out := r.filterBuf[:0]
+	if cap(out) < len(ents) {
+		out = make([]raftpb.Entry, 0, len(ents))
+	}
 	for i := range ents {
 		e := &ents[i]
 		keep := e.Type == raftpb.EntryConfChange || e.Type == raftpb.EntryConfChangeV2 ||
@@ -550,20 +573,41 @@ func (r *raftNode) filterMetronomeEntries(ents []raftpb.Entry) []raftpb.Entry {
 			out = append(out, *e)
 		}
 	}
+	r.filterBuf = out
 	return out
 }
 
 // ---- Work stealing (Metronome §4.2) ---------------------------------
 
+// setWSActiveUntil updates both wsActiveUntil and its atomic mirror
+// wsActiveUntilNanos in lockstep so the lock-free inWorkStealMode read
+// stays consistent. Caller must hold wsMu (or otherwise have exclusive
+// access; tests use this during setup before the Ready loop runs).
+func (r *raftNode) setWSActiveUntil(t time.Time) {
+	r.wsActiveUntil = t
+	if t.IsZero() {
+		r.wsActiveUntilNanos.Store(0)
+	} else {
+		r.wsActiveUntilNanos.Store(t.UnixNano())
+	}
+}
+
 // inWorkStealMode returns true if this node is currently in the
 // "log everything" window triggered by a recent straggler timeout.
+//
+// Lock-free fast path: reads wsActiveUntilNanos atomically. The
+// authoritative time.Time wsActiveUntil is still kept under wsMu for
+// the slow-path writers (maybeTriggerWorkSteal), but readers on the
+// hot path avoid the mutex.
 func (r *raftNode) inWorkStealMode() bool {
 	if r.metronomeScheme == nil {
 		return false
 	}
-	r.wsMu.Lock()
-	defer r.wsMu.Unlock()
-	return !r.wsActiveUntil.IsZero() && time.Now().Before(r.wsActiveUntil)
+	nanos := r.wsActiveUntilNanos.Load()
+	if nanos == 0 {
+		return false
+	}
+	return time.Now().UnixNano() < nanos
 }
 
 // recordReadySkipped bookkeeps which entry indices from `allEnts` were
@@ -599,19 +643,19 @@ func (r *raftNode) recordReadySkipped(hsCommit uint64, allEnts, kept []raftpb.En
 	}
 
 	// 3. Record skipped indices (appended sorted by index; allEnts is
-	//    already index-sorted, and kept is a filtered subsequence).
+	//    already index-sorted, and kept is a filtered subsequence —
+	//    so a two-pointer walk identifies skips in O(len) without
+	//    allocating a membership map per Ready).
 	if len(allEnts) == len(kept) {
 		return // nothing filtered out
 	}
 	wasEmpty := len(r.wsSkipped) == 0
-	keptByIdx := make(map[uint64]struct{}, len(kept))
-	for i := range kept {
-		keptByIdx[kept[i].Index] = struct{}{}
-	}
+	keptIdx := 0
 	for i := range allEnts {
 		e := &allEnts[i]
-		if _, ok := keptByIdx[e.Index]; ok {
-			continue
+		if keptIdx < len(kept) && kept[keptIdx].Index == e.Index {
+			keptIdx++
+			continue // this entry was kept
 		}
 		if e.Index <= r.wsLastCommit {
 			continue // already committed; ignore
@@ -644,7 +688,7 @@ func (r *raftNode) maybeTriggerWorkSteal() {
 			return
 		}
 		// Window elapsed — return to normal filtering.
-		r.wsActiveUntil = time.Time{}
+		r.setWSActiveUntil(time.Time{})
 	}
 	// No skipped entries → nothing to steal.
 	if len(r.wsSkipped) == 0 {
@@ -673,7 +717,7 @@ func (r *raftNode) maybeTriggerWorkSteal() {
 	copy(toFlush, r.wsSkipped)
 	r.wsSkipped = r.wsSkipped[:0]
 	jitter := time.Duration(int64(r.wsDuration) / 8) // ±12.5% jitter
-	r.wsActiveUntil = time.Now().Add(r.wsDuration + jitterDuration(jitter))
+	r.setWSActiveUntil(time.Now().Add(r.wsDuration + jitterDuration(jitter)))
 	r.wsMu.Unlock()
 
 	// Pull the entries from the in-memory raft log and fsync them.

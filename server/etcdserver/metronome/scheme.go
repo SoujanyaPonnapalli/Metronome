@@ -55,6 +55,12 @@ type Scheme struct {
 	// quorumSize is K: the number of nodes that persist each entry.
 	// Invariant: f+1 <= quorumSize <= len(nodeIDs).
 	quorumSize int
+
+	// positionOf maps nodeID -> its position in the sorted nodeIDs slice.
+	// Precomputed at construction so ShouldPersist runs in O(1) instead
+	// of O(K) — important because ShouldPersist is called once per entry
+	// per Ready on the hot path.
+	positionOf map[uint64]int
 }
 
 // DefaultQuorumSize returns f+1 = ceil((numNodes+1)/2), the smallest
@@ -90,7 +96,11 @@ func NewScheme(nodeIDs []uint64, quorumSize int) (*Scheme, error) {
 			return nil, fmt.Errorf("metronome: duplicate nodeID %d", sorted[i])
 		}
 	}
-	return &Scheme{nodeIDs: sorted, quorumSize: quorumSize}, nil
+	pos := make(map[uint64]int, len(sorted))
+	for i, id := range sorted {
+		pos[id] = i
+	}
+	return &Scheme{nodeIDs: sorted, quorumSize: quorumSize, positionOf: pos}, nil
 }
 
 // NumNodes returns N.
@@ -121,15 +131,17 @@ func (s *Scheme) PersistSet(index uint64) []uint64 {
 // ShouldPersist reports whether nodeID should WAL-persist the entry at
 // `index` under this scheme. It returns false when nodeID is not a
 // member of the scheme.
+//
+// O(1): uses the precomputed positionOf map. Equivalent to "is the
+// position of nodeID within K positions ahead of (index mod N)?".
 func (s *Scheme) ShouldPersist(nodeID uint64, index uint64) bool {
-	n := len(s.nodeIDs)
-	start := int(index % uint64(n))
-	for i := 0; i < s.quorumSize; i++ {
-		if s.nodeIDs[(start+i)%n] == nodeID {
-			return true
-		}
+	p, ok := s.positionOf[nodeID]
+	if !ok {
+		return false
 	}
-	return false
+	n := uint64(len(s.nodeIDs))
+	offset := (uint64(p) + n - index%n) % n
+	return offset < uint64(s.quorumSize)
 }
 
 // ShouldFollowerPersistSnapshot reports whether nodeID — known to NOT
