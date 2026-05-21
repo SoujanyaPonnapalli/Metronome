@@ -565,10 +565,16 @@ func (r *raftNode) filterMetronomeEntries(ents []raftpb.Entry) []raftpb.Entry {
 	if cap(out) < len(ents) {
 		out = make([]raftpb.Entry, 0, len(ents))
 	}
+	// Order matters for branch prediction. ShouldPersist is the common
+	// short-circuit (K/N of entries are kept) and is now O(1), so check
+	// it first; ConfChange-fallthrough is rare. With this ordering the
+	// common kept-entry path is 1 op instead of 3.
+	localID := r.localID
 	for i := range ents {
 		e := &ents[i]
-		keep := e.Type == raftpb.EntryConfChange || e.Type == raftpb.EntryConfChangeV2 ||
-			scheme.ShouldPersist(r.localID, e.Index)
+		keep := scheme.ShouldPersist(localID, e.Index) ||
+			e.Type == raftpb.EntryConfChange ||
+			e.Type == raftpb.EntryConfChangeV2
 		if keep {
 			out = append(out, *e)
 		}
