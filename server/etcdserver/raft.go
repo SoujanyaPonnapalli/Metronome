@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -26,6 +27,7 @@ import (
 	"go.etcd.io/etcd/client/pkg/v3/logutil"
 	"go.etcd.io/etcd/pkg/v3/contention"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/rafthttp"
+	"go.etcd.io/etcd/server/v3/etcdserver/metronome"
 	serverstorage "go.etcd.io/etcd/server/v3/storage"
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
@@ -85,6 +87,12 @@ type raftNode struct {
 	latestTickTs time.Time
 	raftNodeConfig
 
+	// metronomeSchemeLive holds the currently active metronome scheme.
+	// It is read (without a lock) on the Ready hot path and is swapped
+	// when membership changes (via UpdateMetronomeScheme, called from
+	// the apply loop after a ConfChange is committed).
+	metronomeSchemeLive atomic.Pointer[metronome.Scheme]
+
 	// a chan to send/receive snapshot
 	msgSnapC chan raftpb.Message
 
@@ -117,6 +125,53 @@ type raftNodeConfig struct {
 	// clients should timeout and reissue their messages.
 	// If transport is nil, server will panic.
 	transport rafthttp.Transporter
+
+	// localID is this node's raft ID. Used by the metronome scheme to
+	// decide whether this node is in the persist-set for a given entry.
+	// Zero when metronomeScheme is nil.
+	localID uint64
+	// metronomeScheme, if non-nil, filters which entries and snapshots
+	// this node WAL-persists. HardState is always persisted regardless
+	// of the scheme. The leader always persists everything.
+	//
+	// The pointer is stored atomically (via metronomeSchemeLive on the
+	// parent raftNode) so that it can be swapped on membership changes
+	// without a lock on the Ready hot path. This config field holds
+	// the initial value set at bootstrap; runtime lookups go through
+	// raftNode.currentScheme().
+	metronomeScheme *metronome.Scheme
+
+	// Work-stealing (Metronome §4.2). A follower tracks entries it
+	// chose not to persist, alongside a timer reset on every
+	// commit-index advance. If the commit stalls long enough while
+	// skipped entries exist, we "steal" logging work from stragglers
+	// by fsyncing the buffered entries ourselves and temporarily
+	// logging every entry (not just our persist-set slot). This
+	// keeps progress going when a peer in the K-of-N persist-set is
+	// slow, at the cost of a small amount of extra logging on this
+	// node.
+	//
+	// All fields below are guarded by wsMu and read/written only on
+	// the raft Ready loop, so contention is minimal.
+	wsMu          sync.Mutex
+	wsSkipped     []uint64  // indices we did not persist (FIFO; kept sorted)
+	wsLastCommit  uint64    // last seen committed index (for advance detection)
+	wsLastAdvance time.Time // wall time of last commit-index advance
+	wsActiveUntil time.Time // non-zero until this time => persist everything
+	wsTimeout     time.Duration
+	wsDuration    time.Duration
+
+	// wsActiveUntilNanos mirrors wsActiveUntil as UnixNano so the
+	// "are we in WS mode?" check can be lock-free on the hot path
+	// (filterMetronomeEntries is called once per Ready). 0 means
+	// inactive. Writes happen under wsMu *and* via atomic Store; reads
+	// outside wsMu must go through Load.
+	wsActiveUntilNanos atomic.Int64
+
+	// filterBuf is a reusable backing slice for filterMetronomeEntries
+	// to avoid per-Ready allocation. Single-goroutine access from the
+	// Ready loop, so no synchronisation needed.
+	filterBuf []raftpb.Entry
 }
 
 func newRaftNode(cfg raftNodeConfig) *raftNode {
@@ -151,7 +206,32 @@ func newRaftNode(cfg raftNodeConfig) *raftNode {
 	} else {
 		r.ticker = time.NewTicker(r.heartbeat)
 	}
+	if cfg.metronomeScheme != nil {
+		r.metronomeSchemeLive.Store(cfg.metronomeScheme)
+	}
 	return r
+}
+
+// currentScheme returns the active metronome scheme, or nil if
+// metronome mode is disabled. Safe to call concurrently; the pointer
+// is swapped atomically on membership changes.
+func (r *raftNode) currentScheme() *metronome.Scheme {
+	return r.metronomeSchemeLive.Load()
+}
+
+// UpdateMetronomeScheme replaces the active scheme. Called from the
+// apply loop after a ConfChange commits, so the scheme reflects the
+// new membership. Passing nil is a no-op (keeps the existing scheme);
+// the scheme cannot be disabled at runtime.
+func (r *raftNode) UpdateMetronomeScheme(s *metronome.Scheme) {
+	if s == nil {
+		return
+	}
+	r.metronomeSchemeLive.Store(s)
+	r.lg.Info("metronome scheme updated",
+		zap.Int("cluster-size", s.NumNodes()),
+		zap.Int("quorum-size", s.QuorumSize()),
+	)
 }
 
 // raft.Node does not have locks in Raft package
@@ -243,15 +323,24 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 				// Must save the snapshot file and WAL snapshot entry before saving any other entries or hardstate to
 				// ensure that recovery after a snapshot restore is possible.
 				if !raft.IsEmptySnap(rd.Snapshot) {
-					// gofail: var raftBeforeSaveSnap struct{}
-					if err := r.storage.SaveSnap(rd.Snapshot); err != nil {
-						r.lg.Fatal("failed to save Raft snapshot", zap.Error(err))
+					if r.shouldPersistSnapshot(islead, rd.Snapshot.Metadata.Index) {
+						// gofail: var raftBeforeSaveSnap struct{}
+						if err := r.storage.SaveSnap(rd.Snapshot); err != nil {
+							r.lg.Fatal("failed to save Raft snapshot", zap.Error(err))
+						}
+						// gofail: var raftAfterSaveSnap struct{}
 					}
-					// gofail: var raftAfterSaveSnap struct{}
 				}
 
+				// Under metronome, filter entries so only nodes in the
+				// persist-set for each entry index WAL-write it.
+				// HardState is always passed through unchanged.
+				entsToSave := r.entriesToPersist(rd.Entries, islead)
+				if r.metronomeScheme != nil {
+					r.recordReadySkipped(rd.HardState.Commit, rd.Entries, entsToSave)
+				}
 				// gofail: var raftBeforeSave struct{}
-				if err := r.storage.Save(rd.HardState, rd.Entries); err != nil {
+				if err := r.storage.Save(rd.HardState, entsToSave); err != nil {
 					r.lg.Fatal("failed to save Raft hard state and entries", zap.Error(err))
 				}
 				if !raft.IsEmptyHardState(rd.HardState) {
@@ -332,6 +421,13 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 					// notify etcdserver that raft has already been notified or advanced.
 					raftAdvancedC <- struct{}{}
 				}
+
+				// Metronome §4.2: cheap stall-check after each Ready.
+				// No-op unless metronome is enabled AND a follower saw
+				// committed-index stall while sitting on skipped entries.
+				if r.metronomeScheme != nil && !islead {
+					r.maybeTriggerWorkSteal()
+				}
 			case <-r.stopped:
 				return
 			}
@@ -396,6 +492,321 @@ func (r *raftNode) processMessages(ms []raftpb.Message) []raftpb.Message {
 		}
 	}
 	return ms
+}
+
+// shouldPersistSnapshot decides whether this node should WAL-persist
+// the raft snapshot at the given index. Every node (leader included)
+// persists only if it is in the snapshot's persist-set; when the scheme
+// is disabled, all nodes persist.
+//
+// `islead` is retained in the signature for future role-aware policy
+// but is intentionally unused today.
+func (r *raftNode) shouldPersistSnapshot(_ bool, snapshotIndex uint64) bool {
+	if r.metronomeScheme == nil {
+		return true
+	}
+	scheme := r.currentScheme()
+	if scheme == nil {
+		return true
+	}
+	return scheme.ShouldPersist(r.localID, snapshotIndex)
+}
+
+// entriesToPersist decides which entries from a single Ready should be
+// fsynced on this node. It is the single seam the Ready loop consults
+// before calling storage.Save.
+//
+// In leader-shuffles metronome, every node (leader included) persists
+// only entries in its rotating persist-set. The leader's own commits
+// are acked from memory; followers' acks already work that way under
+// the canonical scheme. K-of-N copies on disk remain the safety
+// invariant, identical to the canonical scheme but distributed
+// uniformly across all N nodes.
+//
+// `islead` is retained in the signature for future role-aware policy
+// (e.g. an optional "leader always persists ConfChange" override) but
+// is intentionally unused today — see the leader_shuffles_test.go
+// suite for the contract.
+func (r *raftNode) entriesToPersist(ents []raftpb.Entry, _ bool) []raftpb.Entry {
+	if r.metronomeScheme == nil {
+		return ents
+	}
+	return r.filterMetronomeEntries(ents)
+}
+
+// filterMetronomeEntries returns the subset of entries that this
+// node should WAL-persist under the active metronome scheme.
+// Configuration-change entries (EntryConfChange, EntryConfChangeV2) are
+// always kept: membership transitions must be durable on every node so
+// the scheme can be reconstructed post-restart. When the node is in
+// work-stealing mode (after recent straggler-driven timeout), ALL
+// entries are kept regardless of the scheme — strictly stronger than
+// the scheme's K-of-N guarantee, so safety is preserved.
+//
+// Hot path. The Ready loop calls this once per iteration with
+// (typically) 1–50 entries. We:
+//   - early-return when nothing to filter, before any atomic loads;
+//   - read the work-steal flag lock-free via wsActiveUntilNanos;
+//   - reuse a node-local buffer (filterBuf) for the output to avoid
+//     per-Ready allocation.
+func (r *raftNode) filterMetronomeEntries(ents []raftpb.Entry) []raftpb.Entry {
+	if len(ents) == 0 {
+		return ents
+	}
+	if r.inWorkStealMode() {
+		return ents
+	}
+	scheme := r.currentScheme()
+	if scheme == nil {
+		return ents // scheme not set yet; fall back to persist-all
+	}
+	// Reuse the per-node buffer; reset length, keep capacity.
+	out := r.filterBuf[:0]
+	if cap(out) < len(ents) {
+		out = make([]raftpb.Entry, 0, len(ents))
+	}
+	// Order matters for branch prediction. ShouldPersist is the common
+	// short-circuit (K/N of entries are kept) and is now O(1), so check
+	// it first; ConfChange-fallthrough is rare. With this ordering the
+	// common kept-entry path is 1 op instead of 3.
+	localID := r.localID
+	for i := range ents {
+		e := &ents[i]
+		keep := scheme.ShouldPersist(localID, e.Index) ||
+			e.Type == raftpb.EntryConfChange ||
+			e.Type == raftpb.EntryConfChangeV2
+		if keep {
+			out = append(out, *e)
+		}
+	}
+	r.filterBuf = out
+	return out
+}
+
+// ---- Work stealing (Metronome §4.2) ---------------------------------
+
+// setWSActiveUntil updates both wsActiveUntil and its atomic mirror
+// wsActiveUntilNanos in lockstep so the lock-free inWorkStealMode read
+// stays consistent. Caller must hold wsMu (or otherwise have exclusive
+// access; tests use this during setup before the Ready loop runs).
+func (r *raftNode) setWSActiveUntil(t time.Time) {
+	r.wsActiveUntil = t
+	if t.IsZero() {
+		r.wsActiveUntilNanos.Store(0)
+	} else {
+		r.wsActiveUntilNanos.Store(t.UnixNano())
+	}
+}
+
+// inWorkStealMode returns true if this node is currently in the
+// "log everything" window triggered by a recent straggler timeout.
+//
+// Lock-free fast path: reads wsActiveUntilNanos atomically. The
+// authoritative time.Time wsActiveUntil is still kept under wsMu for
+// the slow-path writers (maybeTriggerWorkSteal), but readers on the
+// hot path avoid the mutex.
+func (r *raftNode) inWorkStealMode() bool {
+	if r.metronomeScheme == nil {
+		return false
+	}
+	nanos := r.wsActiveUntilNanos.Load()
+	if nanos == 0 {
+		return false
+	}
+	return time.Now().UnixNano() < nanos
+}
+
+// recordReadySkipped bookkeeps which entry indices from `allEnts` were
+// filtered out of `kept` (i.e., NOT fsynced this Ready), and updates
+// the commit-advance timestamp when HardState.Commit moves forward.
+// Safe to call unconditionally; no-op when metronome is disabled.
+func (r *raftNode) recordReadySkipped(hsCommit uint64, allEnts, kept []raftpb.Entry) {
+	if r.metronomeScheme == nil {
+		return
+	}
+	r.wsMu.Lock()
+	defer r.wsMu.Unlock()
+
+	// 1. Reset the stall timer on commit advance. Also drop skipped
+	//    indices that are now committed — those entries have been
+	//    committed despite us not logging them, so no straggler is
+	//    hurting us on them.
+	if hsCommit > r.wsLastCommit {
+		r.wsLastCommit = hsCommit
+		r.wsLastAdvance = time.Now()
+		if len(r.wsSkipped) > 0 {
+			i := 0
+			for i < len(r.wsSkipped) && r.wsSkipped[i] <= hsCommit {
+				i++
+			}
+			r.wsSkipped = r.wsSkipped[i:]
+		}
+	}
+
+	// 2. In work-stealing mode, everything was persisted — no bookkeeping.
+	if !r.wsActiveUntil.IsZero() && time.Now().Before(r.wsActiveUntil) {
+		return
+	}
+
+	// 3. Record skipped indices (appended sorted by index; allEnts is
+	//    already index-sorted, and kept is a filtered subsequence —
+	//    so a two-pointer walk identifies skips in O(len) without
+	//    allocating a membership map per Ready).
+	if len(allEnts) == len(kept) {
+		return // nothing filtered out
+	}
+	wasEmpty := len(r.wsSkipped) == 0
+	keptIdx := 0
+	for i := range allEnts {
+		e := &allEnts[i]
+		if keptIdx < len(kept) && kept[keptIdx].Index == e.Index {
+			keptIdx++
+			continue // this entry was kept
+		}
+		if e.Index <= r.wsLastCommit {
+			continue // already committed; ignore
+		}
+		r.wsSkipped = append(r.wsSkipped, e.Index)
+	}
+	// 4. Arm the stall timer the moment the buffer transitions 0→N
+	//    (paper §4.2: "the timer is started when an entry is added
+	//    to the buffer"). Without this, the timer sometimes runs
+	//    stale from an earlier Ready and fires spuriously at startup.
+	if wasEmpty && len(r.wsSkipped) > 0 {
+		r.wsLastAdvance = time.Now()
+	}
+}
+
+// maybeTriggerWorkSteal checks the stall condition and, if met,
+// flushes the buffered skipped entries to WAL and enters the
+// "log everything" window for wsDuration. Called from the Ready
+// loop after each iteration — cheap in the common case (O(1) time
+// check; no syscalls unless we actually steal).
+func (r *raftNode) maybeTriggerWorkSteal() {
+	if r.metronomeScheme == nil {
+		return
+	}
+	r.wsMu.Lock()
+	// Already stealing? Exit once the window is up.
+	if !r.wsActiveUntil.IsZero() {
+		if time.Now().Before(r.wsActiveUntil) {
+			r.wsMu.Unlock()
+			return
+		}
+		// Window elapsed — return to normal filtering.
+		r.setWSActiveUntil(time.Time{})
+	}
+	// No skipped entries → nothing to steal.
+	if len(r.wsSkipped) == 0 {
+		r.wsMu.Unlock()
+		return
+	}
+	// Don't fire until we've seen at least one real commit advance.
+	// Otherwise the pre-election / initial-replication startup window
+	// counts against the timeout, and every follower would immediately
+	// enter "log everything" mode the first time we restart, defeating
+	// metronome's whole point.
+	if r.wsLastCommit == 0 {
+		r.wsMu.Unlock()
+		return
+	}
+	// Has the commit stalled long enough?
+	if time.Since(r.wsLastAdvance) < r.wsTimeout {
+		r.wsMu.Unlock()
+		return
+	}
+
+	// Prepare the steal: collect the indices to flush and arm the
+	// work-stealing window before releasing the lock, so other
+	// Readies see us as "in mode" and won't add more to wsSkipped.
+	toFlush := make([]uint64, len(r.wsSkipped))
+	copy(toFlush, r.wsSkipped)
+	r.wsSkipped = r.wsSkipped[:0]
+	jitter := time.Duration(int64(r.wsDuration) / 8) // ±12.5% jitter
+	r.setWSActiveUntil(time.Now().Add(r.wsDuration + jitterDuration(jitter)))
+	r.wsMu.Unlock()
+
+	// Pull the entries from the in-memory raft log and fsync them.
+	ents := r.collectInMemoryEntries(toFlush)
+	if len(ents) > 0 {
+		if err := r.storage.Save(raftpb.HardState{}, ents); err != nil {
+			r.lg.Warn("metronome work-steal: Save failed", zap.Error(err))
+		}
+	}
+	metronomeWorkStealsTriggered.Inc()
+	metronomeWorkStealEntries.Add(float64(len(ents)))
+	r.lg.Info("metronome work-steal fired",
+		zap.Int("skipped-buffered", len(toFlush)),
+		zap.Int("entries-flushed", len(ents)),
+		zap.Duration("window", r.wsDuration),
+	)
+}
+
+// collectInMemoryEntries returns the raft entries for the given
+// indices by reading from raftStorage (in-memory). Indices that are
+// below the compaction floor or above the last index are silently
+// skipped; the caller treats this as "nothing to do."
+func (r *raftNode) collectInMemoryEntries(indices []uint64) []raftpb.Entry {
+	if len(indices) == 0 {
+		return nil
+	}
+	first, err := r.raftStorage.FirstIndex()
+	if err != nil {
+		return nil
+	}
+	last, err := r.raftStorage.LastIndex()
+	if err != nil || last == 0 {
+		return nil
+	}
+	// Group into contiguous runs to minimize Entries() calls.
+	out := make([]raftpb.Entry, 0, len(indices))
+	i := 0
+	for i < len(indices) {
+		j := i + 1
+		for j < len(indices) && indices[j] == indices[j-1]+1 {
+			j++
+		}
+		lo := indices[i]
+		hi := indices[j-1] + 1
+		if lo < first {
+			lo = first
+		}
+		if hi > last+1 {
+			hi = last + 1
+		}
+		if lo < hi {
+			ents, e := r.raftStorage.Entries(lo, hi, ^uint64(0))
+			if e == nil {
+				wanted := make(map[uint64]struct{}, j-i)
+				for k := i; k < j; k++ {
+					wanted[indices[k]] = struct{}{}
+				}
+				for k := range ents {
+					if _, ok := wanted[ents[k].Index]; ok {
+						out = append(out, ents[k])
+					}
+				}
+			}
+		}
+		i = j
+	}
+	return out
+}
+
+// jitterDuration returns a deterministic-enough pseudo-random offset
+// in [-max, max]. We use time.Now() as the source so two concurrent
+// recoverers don't trigger work-stealing synchronously.
+func jitterDuration(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	// Tiny xorshift on nanosecond of now; acceptable for jitter.
+	n := uint64(time.Now().UnixNano())
+	n ^= n >> 16
+	n *= 0x9E3779B97F4A7C15
+	n ^= n >> 33
+	// Map to [-max, max].
+	return time.Duration(int64(n&0xFFFF)%int64(2*max)) - max
 }
 
 func (r *raftNode) apply() chan toApply {
