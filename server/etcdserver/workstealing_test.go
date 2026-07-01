@@ -37,6 +37,12 @@ func newTestRaftNode(t *testing.T, nodeID uint64, clusterIDs []uint64, wsTimeout
 		t.Fatalf("NewScheme: %v", err)
 	}
 	rs := raft.NewMemoryStorage()
+	// The oracle holds the live scheme (read by currentScheme()) and this
+	// node's durable watermark. In production it's built in bootstrap before
+	// StartNode; tests that build raftNode directly must seed it too, else the
+	// filter sees scheme==nil and degenerates to "keep everything".
+	oracle := &metronomeOracle{}
+	oracle.scheme.Store(scheme)
 	rn := &raftNode{
 		lg: zap.NewNop(),
 		raftNodeConfig: raftNodeConfig{
@@ -44,15 +50,11 @@ func newTestRaftNode(t *testing.T, nodeID uint64, clusterIDs []uint64, wsTimeout
 			raftStorage:     rs,
 			localID:         nodeID,
 			metronomeScheme: scheme,
+			metronome:       oracle,
 			wsTimeout:       wsTimeout,
 			wsDuration:      wsDuration,
 		},
 	}
-	// The atomic schemeLive pointer is what currentScheme() reads. In
-	// production it's populated by the newRaftNode constructor; tests
-	// that build raftNode directly must seed it too, otherwise the
-	// filter sees scheme==nil and degenerates to "keep everything".
-	rn.metronomeSchemeLive.Store(scheme)
 	return rn
 }
 
@@ -80,44 +82,44 @@ func entries(from, to uint64) []raftpb.Entry {
 
 // ----- Basic state-machine tests -------------------------------------
 
-func TestRecordReadySkipped_InitializesBaseline(t *testing.T) {
+func TestRecordCommitProgress_TracksAdvance(t *testing.T) {
 	rn := newTestRaftNode(t, /*self=*/ 2, []uint64{1, 2, 3}, 50*time.Millisecond, time.Minute)
 
-	rn.recordReadySkipped(
-		/*hsCommit=*/ 0,
-		/*allEnts=*/ entries(1, 3),
-		/*kept=*/ entries(1, 1), // 2 and 3 skipped
-	)
-	if rn.wsLastAdvance.IsZero() {
-		t.Fatalf("expected baseline timestamp to be set on first Ready")
-	}
-	if len(rn.wsSkipped) != 2 {
-		t.Fatalf("expected 2 skipped indices, got %v", rn.wsSkipped)
-	}
-}
-
-func TestRecordReadySkipped_CommitAdvanceDrainsBuffer(t *testing.T) {
-	rn := newTestRaftNode(t, 2, []uint64{1, 2, 3}, 50*time.Millisecond, time.Minute)
-
-	// Step 1: skip indices 2, 3, 4.
-	rn.recordReadySkipped(0, entries(2, 4), nil)
-	if len(rn.wsSkipped) != 3 {
-		t.Fatalf("want 3 skipped, got %v", rn.wsSkipped)
+	// First observed commit advance sets the baseline timestamp.
+	rn.recordCommitProgress(3)
+	if rn.wsLastCommit != 3 || rn.wsLastAdvance.IsZero() {
+		t.Fatalf("expected commit=3 + baseline set, got commit=%d zero=%v", rn.wsLastCommit, rn.wsLastAdvance.IsZero())
 	}
 	first := rn.wsLastAdvance
 
-	// Sleep a touch so we can observe timestamp advance.
 	time.Sleep(2 * time.Millisecond)
 
-	// Step 2: commit advances to 3. Entries 2,3 should be dropped;
-	// entry 4 remains in buffer. wsLastAdvance should be refreshed.
-	rn.recordReadySkipped(3, nil, nil)
-	if got := rn.wsSkipped; len(got) != 1 || got[0] != 4 {
-		t.Fatalf("want only [4] remaining, got %v", got)
+	// A further advance refreshes the stall timer.
+	rn.recordCommitProgress(6)
+	if rn.wsLastCommit != 6 || !rn.wsLastAdvance.After(first) {
+		t.Fatalf("expected commit=6 + refreshed timer, got commit=%d", rn.wsLastCommit)
 	}
-	if !rn.wsLastAdvance.After(first) {
-		t.Fatalf("expected wsLastAdvance to advance on commit progress")
+
+	// No advance (commit unchanged) must NOT move the timer — that is what
+	// lets a genuine stall accumulate toward the timeout.
+	prev := rn.wsLastAdvance
+	rn.recordCommitProgress(6)
+	if !rn.wsLastAdvance.Equal(prev) {
+		t.Fatalf("timer must not move without a commit advance")
 	}
+}
+
+// countSchemeSkips mirrors maybeTriggerWorkSteal's lazy reconstruction:
+// the indices in (afterCommit, last] this node is NOT assigned to persist.
+func countSchemeSkips(rn *raftNode, afterCommit, last uint64) int {
+	s := rn.currentScheme()
+	n := 0
+	for idx := afterCommit + 1; idx <= last; idx++ {
+		if !s.ShouldPersist(rn.localID, idx) {
+			n++
+		}
+	}
+	return n
 }
 
 // ----- Trigger tests -------------------------------------------------
@@ -128,16 +130,18 @@ func TestMaybeTriggerWorkSteal_FiresOnStall(t *testing.T) {
 		/*wsDuration=*/ 100*time.Millisecond)
 	seedMemoryStorage(t, rn, 1, 10)
 
-	// Simulate: skipped a few, cluster has advanced at least once
-	// before (wsLastCommit set), commit progress stalled since.
-	rn.wsSkipped = []uint64{3, 5, 7}
-	rn.wsLastCommit = 2 // real prior commit observed
+	// Cluster advanced at least once before (wsLastCommit set), then commit
+	// stalled past the timeout with entries pending (last=10 > committed=2).
+	rn.wsLastCommit = 2
 	rn.wsLastAdvance = time.Now().Add(-50 * time.Millisecond) // stale
-
-	// Inject a no-op storage so Save doesn't panic.
 	rn.storage = &noopStorage{}
 
-	// Record before + fire.
+	// The flush set is reconstructed from the scheme, not a buffer.
+	want := countSchemeSkips(rn, 2, 10)
+	if want == 0 {
+		t.Fatal("test setup: expected some scheme-skipped entries to flush")
+	}
+
 	beforeTriggered := counterValue(metronomeWorkStealsTriggered)
 	beforeEntries := counterValue(metronomeWorkStealEntries)
 
@@ -146,17 +150,11 @@ func TestMaybeTriggerWorkSteal_FiresOnStall(t *testing.T) {
 	if !rn.inWorkStealMode() {
 		t.Fatalf("expected work-steal mode to be active after trigger")
 	}
-	if len(rn.wsSkipped) != 0 {
-		t.Fatalf("expected skipped buffer drained, got %v", rn.wsSkipped)
+	if got := counterValue(metronomeWorkStealsTriggered); got != beforeTriggered+1 {
+		t.Fatalf("triggered counter: before=%v after=%v", beforeTriggered, got)
 	}
-
-	afterTriggered := counterValue(metronomeWorkStealsTriggered)
-	afterEntries := counterValue(metronomeWorkStealEntries)
-	if afterTriggered != beforeTriggered+1 {
-		t.Fatalf("metronome_work_steals_triggered_total should have incremented by 1 (before=%v after=%v)", beforeTriggered, afterTriggered)
-	}
-	if afterEntries != beforeEntries+3 {
-		t.Fatalf("metronome_work_steal_entries_written_total should have increased by 3 (before=%v after=%v)", beforeEntries, afterEntries)
+	if got := counterValue(metronomeWorkStealEntries); got != beforeEntries+float64(want) {
+		t.Fatalf("entries counter: want +%d (scheme-skipped in (2,10]), before=%v after=%v", want, beforeEntries, got)
 	}
 }
 
@@ -169,8 +167,7 @@ func TestMaybeTriggerWorkSteal_FiresOnStall(t *testing.T) {
 // collapse to zero.
 func TestMaybeTriggerWorkSteal_NoFireBeforeFirstCommit(t *testing.T) {
 	rn := newTestRaftNode(t, 2, []uint64{1, 2, 3}, 1*time.Millisecond, time.Minute)
-	seedMemoryStorage(t, rn, 1, 5)
-	rn.wsSkipped = []uint64{2, 3}
+	seedMemoryStorage(t, rn, 1, 5) // entries pending (last=5)
 	// wsLastCommit == 0 simulates "haven't seen a commit advance yet."
 	rn.wsLastAdvance = time.Now().Add(-1 * time.Second) // would otherwise trigger
 	rn.storage = &noopStorage{}
@@ -184,14 +181,16 @@ func TestMaybeTriggerWorkSteal_NoFireBeforeFirstCommit(t *testing.T) {
 	}
 }
 
-func TestMaybeTriggerWorkSteal_NoFireWhenEmpty(t *testing.T) {
+func TestMaybeTriggerWorkSteal_NoFireWhenCommitCaughtUp(t *testing.T) {
 	rn := newTestRaftNode(t, 2, []uint64{1, 2, 3}, 1*time.Millisecond, time.Minute)
+	seedMemoryStorage(t, rn, 1, 5)
+	rn.wsLastCommit = 5 // commit == last: nothing pending blocks commit
 	rn.wsLastAdvance = time.Now().Add(-1 * time.Second)
-	// buffer is empty
+	rn.storage = &noopStorage{}
 	before := counterValue(metronomeWorkStealsTriggered)
 	rn.maybeTriggerWorkSteal()
 	if rn.inWorkStealMode() {
-		t.Fatalf("should not enter WS mode with empty buffer")
+		t.Fatalf("should not fire when commit has caught up (no pending entries)")
 	}
 	if counterValue(metronomeWorkStealsTriggered) != before {
 		t.Fatalf("should not have incremented trigger counter")
@@ -200,8 +199,9 @@ func TestMaybeTriggerWorkSteal_NoFireWhenEmpty(t *testing.T) {
 
 func TestMaybeTriggerWorkSteal_NoFireWithinTimeout(t *testing.T) {
 	rn := newTestRaftNode(t, 2, []uint64{1, 2, 3}, 1*time.Second, time.Minute)
-	rn.wsSkipped = []uint64{5}
-	rn.wsLastAdvance = time.Now() // fresh
+	seedMemoryStorage(t, rn, 1, 5)
+	rn.wsLastCommit = 1            // pending 2..5
+	rn.wsLastAdvance = time.Now()  // fresh — within timeout
 	rn.storage = &noopStorage{}
 	before := counterValue(metronomeWorkStealsTriggered)
 	rn.maybeTriggerWorkSteal()
@@ -218,8 +218,7 @@ func TestMaybeTriggerWorkSteal_ExitsAfterDuration(t *testing.T) {
 		1*time.Millisecond,
 		10*time.Millisecond)
 	seedMemoryStorage(t, rn, 1, 5)
-	rn.wsSkipped = []uint64{2, 3}
-	rn.wsLastCommit = 1 // simulate prior commit observed
+	rn.wsLastCommit = 1 // prior commit observed; pending 2..5
 	rn.wsLastAdvance = time.Now().Add(-1 * time.Second)
 	rn.storage = &noopStorage{}
 
@@ -231,9 +230,16 @@ func TestMaybeTriggerWorkSteal_ExitsAfterDuration(t *testing.T) {
 	// Wait past the WS window.
 	time.Sleep(30 * time.Millisecond)
 
+	// Simulate the stall clearing: commit advanced to the log tail, so there
+	// is nothing left blocking commit. The trigger fires on a persistent
+	// COMMIT stall, so once commit catches up it must exit the window and
+	// revert to the shuffling scheme (not re-enter persist-everything).
+	rn.wsLastCommit = 5
+	rn.wsLastAdvance = time.Now()
+
 	rn.maybeTriggerWorkSteal()
 	if rn.inWorkStealMode() {
-		t.Fatalf("expected WS window to have elapsed")
+		t.Fatalf("expected WS window to have elapsed and not re-fire once commit caught up")
 	}
 }
 
@@ -251,37 +257,23 @@ func TestFilterMetronomeEntries_PassthroughInWSMode(t *testing.T) {
 	}
 }
 
-// ----- Safety property: buffer ordering ------------------------------
+// ----- Lazy flush reconstruction -------------------------------------
 
-// Skipped indices, once tracked, must be drained in order whenever
-// commit advances past them. This test exercises that with interleaved
-// Readies.
-func TestWorkSteal_BufferDrainedInCommitOrder(t *testing.T) {
-	rn := newTestRaftNode(t, 2, []uint64{1, 2, 3}, 100*time.Millisecond, time.Minute)
+// On a stall, the entries flushed are reconstructed from the scheme over
+// the pending range (committed, last] — exactly this node's skipped
+// indices — with no per-Ready buffer maintained.
+func TestWorkSteal_FlushReconstructedFromScheme(t *testing.T) {
+	rn := newTestRaftNode(t, 2, []uint64{1, 2, 3}, 5*time.Millisecond, time.Minute)
+	seedMemoryStorage(t, rn, 1, 12)
+	rn.wsLastCommit = 4 // pending 5..12
+	rn.wsLastAdvance = time.Now().Add(-1 * time.Second)
+	rn.storage = &noopStorage{}
 
-	// Three Readies add indices 2..4, 5..7, 8..10 to buffer (none kept).
-	rn.recordReadySkipped(0, entries(2, 4), nil)
-	rn.recordReadySkipped(0, entries(5, 7), nil)
-	rn.recordReadySkipped(0, entries(8, 10), nil)
-	if len(rn.wsSkipped) != 9 {
-		t.Fatalf("want 9 buffered, got %d", len(rn.wsSkipped))
-	}
-
-	// Commit to 6 → first half should drain.
-	rn.recordReadySkipped(6, nil, nil)
-	if len(rn.wsSkipped) != 4 {
-		t.Fatalf("want 4 buffered after commit=6, got %v", rn.wsSkipped)
-	}
-	for _, idx := range rn.wsSkipped {
-		if idx <= 6 {
-			t.Fatalf("index %d still buffered despite commit=6", idx)
-		}
-	}
-
-	// Commit to 10 → buffer empty.
-	rn.recordReadySkipped(10, nil, nil)
-	if len(rn.wsSkipped) != 0 {
-		t.Fatalf("expected empty buffer after commit=10, got %v", rn.wsSkipped)
+	want := countSchemeSkips(rn, 4, 12)
+	beforeEntries := counterValue(metronomeWorkStealEntries)
+	rn.maybeTriggerWorkSteal()
+	if got := counterValue(metronomeWorkStealEntries); got != beforeEntries+float64(want) {
+		t.Fatalf("flushed entries: want +%d (scheme-skipped in (4,12]), before=%v after=%v", want, beforeEntries, got)
 	}
 }
 

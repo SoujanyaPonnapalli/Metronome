@@ -87,12 +87,6 @@ type raftNode struct {
 	latestTickTs time.Time
 	raftNodeConfig
 
-	// metronomeSchemeLive holds the currently active metronome scheme.
-	// It is read (without a lock) on the Ready hot path and is swapped
-	// when membership changes (via UpdateMetronomeScheme, called from
-	// the apply loop after a ConfChange is committed).
-	metronomeSchemeLive atomic.Pointer[metronome.Scheme]
-
 	// a chan to send/receive snapshot
 	msgSnapC chan raftpb.Message
 
@@ -130,16 +124,18 @@ type raftNodeConfig struct {
 	// decide whether this node is in the persist-set for a given entry.
 	// Zero when metronomeScheme is nil.
 	localID uint64
-	// metronomeScheme, if non-nil, filters which entries and snapshots
-	// this node WAL-persists. HardState is always persisted regardless
-	// of the scheme. The leader always persists everything.
-	//
-	// The pointer is stored atomically (via metronomeSchemeLive on the
-	// parent raftNode) so that it can be swapped on membership changes
-	// without a lock on the Ready hot path. This config field holds
-	// the initial value set at bootstrap; runtime lookups go through
-	// raftNode.currentScheme().
+	// metronomeScheme, if non-nil, marks metronome mode enabled and holds the
+	// initial scheme. It filters which entries and snapshots this node
+	// WAL-persists (HardState is always persisted). Used only as the
+	// enabled-flag; runtime persist decisions go through currentScheme().
 	metronomeScheme *metronome.Scheme
+
+	// metronome is the shared oracle holding the live scheme pointer and this
+	// node's durable watermark. It is created before raft.StartNode (so the
+	// raft.Config.Metronome predicate is in place at startup) and shared with
+	// the raft library's per-entry durability commit rule. Nil iff metronome
+	// is disabled. currentScheme() and the durable watermark route through it.
+	metronome *metronomeOracle
 
 	// Work-stealing (Metronome §4.2). A follower tracks entries it
 	// chose not to persist, alongside a timer reset on every
@@ -151,10 +147,12 @@ type raftNodeConfig struct {
 	// slow, at the cost of a small amount of extra logging on this
 	// node.
 	//
-	// All fields below are guarded by wsMu and read/written only on
-	// the raft Ready loop, so contention is minimal.
+	// All fields below are read/written only on the raft Ready-loop
+	// goroutine (recordCommitProgress + maybeTriggerWorkSteal), so the
+	// steady-state path needs no lock. wsMu is taken only on the rare
+	// work-steal FIRING path to pair the wsActiveUntil write with the
+	// lock-free atomic mirror that the raft goroutine reads.
 	wsMu          sync.Mutex
-	wsSkipped     []uint64  // indices we did not persist (FIFO; kept sorted)
 	wsLastCommit  uint64    // last seen committed index (for advance detection)
 	wsLastAdvance time.Time // wall time of last commit-index advance
 	wsActiveUntil time.Time // non-zero until this time => persist everything
@@ -206,17 +204,73 @@ func newRaftNode(cfg raftNodeConfig) *raftNode {
 	} else {
 		r.ticker = time.NewTicker(r.heartbeat)
 	}
-	if cfg.metronomeScheme != nil {
-		r.metronomeSchemeLive.Store(cfg.metronomeScheme)
+	if r.metronome != nil {
+		// Let the commit rule detect when this node is logging everything, so
+		// it falls back to the standard rule during work-steal recovery.
+		r.metronome.logEverything = r.inWorkStealMode
 	}
 	return r
 }
 
-// currentScheme returns the active metronome scheme, or nil if
-// metronome mode is disabled. Safe to call concurrently; the pointer
-// is swapped atomically on membership changes.
+// metronomeOracle holds the live metronome scheme and this node's durable
+// watermark, shared between the etcd raftNode (which updates them) and the
+// raft library's per-entry durability commit rule (which reads them via
+// raft.Config.Metronome). It is constructed before raft.StartNode so the
+// predicate is in place when the node starts. Implements raft.MetronomeOracle.
+type metronomeOracle struct {
+	scheme  atomic.Pointer[metronome.Scheme]
+	durable atomic.Uint64 // this node's durable watermark index (post-fsync)
+	// logEverything reports whether this node is in work-steal "log
+	// everything" mode. Wired to raftNode.inWorkStealMode.
+	logEverything func() bool
+	// stallTicks / windowTicks express the work-steal timeout and persist-
+	// everything duration in leader ticks, for the raft library's leader-driven
+	// commit-stall fallback. Set at bootstrap from wsTimeout/wsDuration/TickMs.
+	stallTicks  int
+	windowTicks int
+}
+
+// ShouldPersist reports whether node id is assigned to persist index under the
+// live scheme.
+func (o *metronomeOracle) ShouldPersist(id, index uint64) bool {
+	s := o.scheme.Load()
+	return s != nil && s.ShouldPersist(id, index)
+}
+
+// Quorum returns T, the number of distinct durable copies required to commit
+// (the live scheme's K).
+func (o *metronomeOracle) Quorum() int {
+	s := o.scheme.Load()
+	if s == nil {
+		return 0
+	}
+	return s.QuorumSize()
+}
+
+// SelfDurable returns this node's own durable watermark, advanced only after
+// its storage fsync returns.
+func (o *metronomeOracle) SelfDurable() uint64 { return o.durable.Load() }
+
+// SelfLogEverything reports whether this node is in work-steal "log
+// everything" mode (and the commit rule should fall back to standard raft).
+func (o *metronomeOracle) SelfLogEverything() bool {
+	return o.logEverything != nil && o.logEverything()
+}
+
+// StallTicks is the work-steal timeout in leader ticks.
+func (o *metronomeOracle) StallTicks() int { return o.stallTicks }
+
+// WindowTicks is the persist-everything duration in leader ticks.
+func (o *metronomeOracle) WindowTicks() int { return o.windowTicks }
+
+// currentScheme returns the active metronome scheme, or nil if metronome mode
+// is disabled. Safe to call concurrently; the pointer is swapped atomically on
+// membership changes.
 func (r *raftNode) currentScheme() *metronome.Scheme {
-	return r.metronomeSchemeLive.Load()
+	if r.metronome == nil {
+		return nil
+	}
+	return r.metronome.scheme.Load()
 }
 
 // UpdateMetronomeScheme replaces the active scheme. Called from the
@@ -224,14 +278,41 @@ func (r *raftNode) currentScheme() *metronome.Scheme {
 // new membership. Passing nil is a no-op (keeps the existing scheme);
 // the scheme cannot be disabled at runtime.
 func (r *raftNode) UpdateMetronomeScheme(s *metronome.Scheme) {
-	if s == nil {
+	if s == nil || r.metronome == nil {
 		return
 	}
-	r.metronomeSchemeLive.Store(s)
+	r.metronome.scheme.Store(s)
 	r.lg.Info("metronome scheme updated",
 		zap.Int("cluster-size", s.NumNodes()),
 		zap.Int("quorum-size", s.QuorumSize()),
 	)
+}
+
+// attachMetronomeDurable stamps this node's durable watermark (index + term)
+// and its out-of-stripe stolen copies onto every outgoing MsgAppResp via the
+// Context field, so the leader's per-entry durability commit rule can count
+// this node. No-op when metronome is disabled or nothing is durable yet.
+// Called from the follower send path on the Ready loop goroutine; reads
+// raftStorage.Term without a lock because that goroutine is the only writer of
+// the durable watermark.
+func (r *raftNode) attachMetronomeDurable(msgs []raftpb.Message) {
+	if r.metronome == nil {
+		return
+	}
+	w := r.metronome.durable.Load()
+	if w == 0 {
+		return
+	}
+	var term uint64
+	if t, err := r.raftStorage.Term(w); err == nil {
+		term = t
+	}
+	ctx := raft.EncodeDurableReport(raft.DurableReport{Index: w, Term: term})
+	for i := range msgs {
+		if msgs[i].Type == raftpb.MsgAppResp {
+			msgs[i].Context = ctx
+		}
+	}
 }
 
 // raft.Node does not have locks in Raft package
@@ -337,7 +418,7 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 				// HardState is always passed through unchanged.
 				entsToSave := r.entriesToPersist(rd.Entries, islead)
 				if r.metronomeScheme != nil {
-					r.recordReadySkipped(rd.HardState.Commit, rd.Entries, entsToSave)
+					r.recordCommitProgress(rd.HardState.Commit)
 				}
 				// gofail: var raftBeforeSave struct{}
 				if err := r.storage.Save(rd.HardState, entsToSave); err != nil {
@@ -371,6 +452,28 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 					// gofail: var raftAfterWALRelease struct{}
 				}
 
+				// Metronome: this Ready's WAL writes (our persist-set entries
+				// and any snapshot) have now fsynced, so advance this node's
+				// durable watermark. Every index <= the highest appended index
+				// that we were assigned to persist is on disk — we never skip
+				// our own stripe — so the watermark is the highest appended (or
+				// snapshot) index. The leader's per-entry durability commit rule
+				// reads this (its own row via SelfDurable, followers' via the
+				// report we attach to MsgAppResp). Advanced ONLY post-fsync so a
+				// pre-fsync memory copy is never counted toward commit.
+				if r.metronome != nil {
+					var w uint64
+					if n := len(rd.Entries); n > 0 {
+						w = rd.Entries[n-1].Index
+					}
+					if !raft.IsEmptySnap(rd.Snapshot) && rd.Snapshot.Metadata.Index > w {
+						w = rd.Snapshot.Metadata.Index
+					}
+					if w > r.metronome.durable.Load() {
+						r.metronome.durable.Store(w)
+					}
+				}
+
 				r.raftStorage.Append(rd.Entries)
 
 				confChanged := false
@@ -384,6 +487,12 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 				if !islead {
 					// finish processing incoming messages before we signal notifyc chan
 					msgs := r.processMessages(rd.Messages)
+
+					// Metronome: piggyback this node's durable watermark on each
+					// outgoing MsgAppResp (in Context) so the leader's per-entry
+					// durability commit rule can count us. Match still carries the
+					// in-memory ack for flow control; durability rides separately.
+					r.attachMetronomeDurable(msgs)
 
 					// now unblocks 'applyAll' that waits on Raft log disk writes before triggering snapshots
 					notifyc <- struct{}{}
@@ -423,9 +532,15 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 				}
 
 				// Metronome §4.2: cheap stall-check after each Ready.
-				// No-op unless metronome is enabled AND a follower saw
-				// committed-index stall while sitting on skipped entries.
-				if r.metronomeScheme != nil && !islead {
+				// No-op unless metronome is enabled and this node is sitting
+				// on skipped entries while the committed index has stalled.
+				// The LEADER participates too: under the per-entry durability
+				// commit rule a committed index needs f+1 on-disk copies, so
+				// when a persister is down the leader must also steal (log the
+				// entries it skipped) to supply a durable copy for indices
+				// whose persist-set excluded it — otherwise commit deadlocks
+				// on those indices with no node willing to persist them.
+				if r.metronomeScheme != nil {
 					r.maybeTriggerWorkSteal()
 				}
 			case <-r.stopped:
@@ -620,59 +735,22 @@ func (r *raftNode) inWorkStealMode() bool {
 // filtered out of `kept` (i.e., NOT fsynced this Ready), and updates
 // the commit-advance timestamp when HardState.Commit moves forward.
 // Safe to call unconditionally; no-op when metronome is disabled.
-func (r *raftNode) recordReadySkipped(hsCommit uint64, allEnts, kept []raftpb.Entry) {
+// recordCommitProgress tracks the global committed index for work-steal
+// stall detection. It is the ENTIRE steady-state work-steal cost: a single
+// comparison, and on a commit advance two field writes. There is no
+// per-Ready skip buffer, lock, or O(len) walk — the set of skipped entries
+// to flush is reconstructed lazily from the scheme only if work-steal
+// actually fires (see maybeTriggerWorkSteal). Runs on the Ready-loop
+// goroutine, the sole writer of these fields.
+func (r *raftNode) recordCommitProgress(hsCommit uint64) {
 	if r.metronomeScheme == nil {
 		return
 	}
-	r.wsMu.Lock()
-	defer r.wsMu.Unlock()
-
-	// 1. Reset the stall timer on commit advance. Also drop skipped
-	//    indices that are now committed — those entries have been
-	//    committed despite us not logging them, so no straggler is
-	//    hurting us on them.
+	// Reset the stall timer whenever the committed index advances. If commit
+	// keeps advancing the cluster is healthy; only a genuine stall (no
+	// advance for wsTimeout while entries are pending) triggers work-steal.
 	if hsCommit > r.wsLastCommit {
 		r.wsLastCommit = hsCommit
-		r.wsLastAdvance = time.Now()
-		if len(r.wsSkipped) > 0 {
-			i := 0
-			for i < len(r.wsSkipped) && r.wsSkipped[i] <= hsCommit {
-				i++
-			}
-			r.wsSkipped = r.wsSkipped[i:]
-		}
-	}
-
-	// 2. In work-stealing mode, everything was persisted — no bookkeeping.
-	if !r.wsActiveUntil.IsZero() && time.Now().Before(r.wsActiveUntil) {
-		return
-	}
-
-	// 3. Record skipped indices (appended sorted by index; allEnts is
-	//    already index-sorted, and kept is a filtered subsequence —
-	//    so a two-pointer walk identifies skips in O(len) without
-	//    allocating a membership map per Ready).
-	if len(allEnts) == len(kept) {
-		return // nothing filtered out
-	}
-	wasEmpty := len(r.wsSkipped) == 0
-	keptIdx := 0
-	for i := range allEnts {
-		e := &allEnts[i]
-		if keptIdx < len(kept) && kept[keptIdx].Index == e.Index {
-			keptIdx++
-			continue // this entry was kept
-		}
-		if e.Index <= r.wsLastCommit {
-			continue // already committed; ignore
-		}
-		r.wsSkipped = append(r.wsSkipped, e.Index)
-	}
-	// 4. Arm the stall timer the moment the buffer transitions 0→N
-	//    (paper §4.2: "the timer is started when an entry is added
-	//    to the buffer"). Without this, the timer sometimes runs
-	//    stale from an earlier Ready and fires spuriously at startup.
-	if wasEmpty && len(r.wsSkipped) > 0 {
 		r.wsLastAdvance = time.Now()
 	}
 }
@@ -696,8 +774,15 @@ func (r *raftNode) maybeTriggerWorkSteal() {
 		// Window elapsed — return to normal filtering.
 		r.setWSActiveUntil(time.Time{})
 	}
-	// No skipped entries → nothing to steal.
-	if len(r.wsSkipped) == 0 {
+	// Fire on a COMMIT STALL with pending entries — not merely on having a
+	// non-empty skip buffer. The leader must enter persist-everything even
+	// when the index blocking commit is in ITS OWN stripe (so its skip buffer
+	// is empty): only by switching to the standard commit rule (see
+	// maybeCommit's SelfLogEverything fallback) can it unblock commit when a
+	// persister is down. "Pending entries" = our log extends past the
+	// committed index.
+	last, lerr := r.raftStorage.LastIndex()
+	if lerr != nil || last <= r.wsLastCommit {
 		r.wsMu.Unlock()
 		return
 	}
@@ -710,18 +795,26 @@ func (r *raftNode) maybeTriggerWorkSteal() {
 		r.wsMu.Unlock()
 		return
 	}
-	// Has the commit stalled long enough?
+	// Has the committed index stalled long enough? Trigger is based purely on
+	// the global commit index not advancing (not on which entry we hold) —
+	// when it stalls past the timeout while we have buffered entries, log them.
 	if time.Since(r.wsLastAdvance) < r.wsTimeout {
 		r.wsMu.Unlock()
 		return
 	}
 
-	// Prepare the steal: collect the indices to flush and arm the
-	// work-stealing window before releasing the lock, so other
-	// Readies see us as "in mode" and won't add more to wsSkipped.
-	toFlush := make([]uint64, len(r.wsSkipped))
-	copy(toFlush, r.wsSkipped)
-	r.wsSkipped = r.wsSkipped[:0]
+	// Prepare the steal: reconstruct the skipped indices to flush directly
+	// from the scheme over the pending range (wsLastCommit, last] — the
+	// entries this node did NOT persist. Doing it here (rare firing path)
+	// instead of buffering every Ready keeps the steady-state path free.
+	var toFlush []uint64
+	if scheme := r.currentScheme(); scheme != nil {
+		for idx := r.wsLastCommit + 1; idx <= last; idx++ {
+			if !scheme.ShouldPersist(r.localID, idx) {
+				toFlush = append(toFlush, idx)
+			}
+		}
+	}
 	jitter := time.Duration(int64(r.wsDuration) / 8) // ±12.5% jitter
 	r.setWSActiveUntil(time.Now().Add(r.wsDuration + jitterDuration(jitter)))
 	r.wsMu.Unlock()

@@ -19,3 +19,5 @@ use (
 	./tools/rw-heatmaps
 	./tools/testgrid-analysis
 )
+
+replace go.etcd.io/raft/v3 => ./third_party/raft

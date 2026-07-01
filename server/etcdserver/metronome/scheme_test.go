@@ -60,52 +60,94 @@ func TestNewSchemeValidation(t *testing.T) {
 	}
 }
 
-// TestShouldPersistCoverage verifies that across consecutive entries,
-// every node is in some persist-set (load balancing property).
+// binom returns C(n, k).
+func binom(n, k int) int {
+	if k < 0 || k > n {
+		return 0
+	}
+	if k > n-k {
+		k = n - k
+	}
+	res := 1
+	for i := 0; i < k; i++ {
+		res = res * (n - i) / (i + 1)
+	}
+	return res
+}
+
+// TestShouldPersistCoverage verifies the distance-maximized schedule is
+// load-balanced: over one full period (C(N,K) entries) every node persists
+// an equal share C(N-1,K-1), and every persist-set is exactly K nodes.
 func TestShouldPersistCoverage(t *testing.T) {
 	nodes := []uint64{10, 20, 30, 40, 50}
-	s, err := NewScheme(nodes, 3) // K=f+1=3
+	s, err := NewScheme(nodes, 3) // K=f+1=3, N=5, period C(5,3)=10
 	if err != nil {
 		t.Fatal(err)
 	}
-	// For N entries, each node should persist exactly K of them.
+	period := uint64(s.Period())
 	counts := map[uint64]int{}
-	for idx := uint64(0); idx < uint64(s.NumNodes()); idx++ {
-		for _, id := range s.PersistSet(idx) {
+	for idx := uint64(0); idx < period; idx++ {
+		ps := s.PersistSet(idx)
+		if len(ps) != s.QuorumSize() {
+			t.Fatalf("persist-set at %d has %d members, want K=%d", idx, len(ps), s.QuorumSize())
+		}
+		for _, id := range ps {
 			counts[id]++
 		}
 	}
+	want := binom(s.NumNodes()-1, s.QuorumSize()-1) // each node's share per period
 	for _, id := range nodes {
-		if counts[id] != s.QuorumSize() {
-			t.Errorf("node %d: persisted %d entries in a window of %d, want %d", id, counts[id], s.NumNodes(), s.QuorumSize())
+		if counts[id] != want {
+			t.Errorf("node %d: persisted %d/period, want balanced %d", id, counts[id], want)
 		}
 	}
 }
 
-// TestShouldPersistMajorityIntersection verifies that any two
-// consecutive persist-sets overlap in at least (K - 1) nodes, and any
-// two arbitrary persist-sets overlap in at least 2K - N nodes (the
-// majority intersection property that underpins safety).
-func TestShouldPersistMajorityIntersection(t *testing.T) {
+// TestPersistSetSpread verifies the two things that matter for the
+// distance-maximized ordering: (1) the durability invariant — every
+// persist-set is exactly K distinct nodes (a majority, so every entry has
+// K>=f+1 persisters); and (2) the spread — the mean overlap between
+// consecutive persist-sets is BELOW the naive index%N rotation's K-1, i.e.
+// the ordering actually keeps consecutive entries off the same nodes (the
+// regression we are fixing).
+func TestPersistSetSpread(t *testing.T) {
 	nodes := []uint64{1, 2, 3, 4, 5}
-	s, _ := NewScheme(nodes, 3)
-	minOverlap := 2*s.QuorumSize() - s.NumNodes() // 1
-	for a := uint64(0); a < 20; a++ {
-		for b := a + 1; b < 25; b++ {
-			setA := map[uint64]bool{}
-			for _, id := range s.PersistSet(a) {
-				setA[id] = true
+	s, _ := NewScheme(nodes, 3) // K=3, N=5
+	period := s.Period()
+
+	for a := 0; a < period; a++ {
+		ps := s.PersistSet(uint64(a))
+		if len(ps) != s.QuorumSize() {
+			t.Fatalf("persist-set %d size %d, want K=%d", a, len(ps), s.QuorumSize())
+		}
+		seen := map[uint64]bool{}
+		for _, id := range ps {
+			if seen[id] {
+				t.Fatalf("duplicate node in persist-set %d", a)
 			}
-			overlap := 0
-			for _, id := range s.PersistSet(b) {
-				if setA[id] {
-					overlap++
-				}
-			}
-			if overlap < minOverlap {
-				t.Errorf("persist sets at %d and %d overlap in %d nodes, need >= %d", a, b, overlap, minOverlap)
+			seen[id] = true
+		}
+	}
+
+	total, pairs := 0, 0
+	for a := 0; a < period; a++ {
+		b := (a + 1) % period
+		setA := map[uint64]bool{}
+		for _, id := range s.PersistSet(uint64(a)) {
+			setA[id] = true
+		}
+		ov := 0
+		for _, id := range s.PersistSet(uint64(b)) {
+			if setA[id] {
+				ov++
 			}
 		}
+		total += ov
+		pairs++
+	}
+	mean := float64(total) / float64(pairs)
+	if mean >= float64(s.QuorumSize()-1) {
+		t.Errorf("mean consecutive overlap %.2f is not below naive K-1=%d; distance ordering ineffective", mean, s.QuorumSize()-1)
 	}
 }
 

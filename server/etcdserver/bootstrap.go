@@ -618,19 +618,13 @@ func raftConfig(cfg config.ServerConfig, id uint64, s *raft.MemoryStorage) *raft
 }
 
 func (b *bootstrappedRaft) newRaftNode(cfg config.ServerConfig, ss snap.Snapshotter, wal *wal.WAL, cl *membership.RaftCluster) *raftNode {
-	var n raft.Node
-	if len(b.peers) == 0 {
-		n = raft.RestartNode(b.config)
-	} else {
-		n = raft.StartNode(b.config, b.peers)
-	}
-	raftStatusMu.Lock()
-	raftStatus = n.Status
-	raftStatusMu.Unlock()
-
-	// Build the metronome scheme if enabled. Disabled for N=1 (single-node
-	// clusters don't benefit and the round-robin collapses to "always persist").
+	// Build the metronome scheme + oracle BEFORE starting the node, so the
+	// raft.Config.Metronome predicate (the per-entry durability-gated commit
+	// rule) is installed when StartNode/RestartNode constructs the raft state.
+	// Disabled for N=1 (single-node clusters don't benefit and the round-robin
+	// collapses to "always persist").
 	var scheme *metronome.Scheme
+	var oracle *metronomeOracle
 	localID := b.config.ID
 	if cfg.Metronome && cl != nil && len(cl.VotingMemberIDs()) > 1 {
 		// Metronome's safety invariant (K ≥ f+1) is defined over
@@ -649,6 +643,9 @@ func (b *bootstrappedRaft) newRaftNode(cfg config.ServerConfig, ss snap.Snapshot
 			b.lg.Fatal("failed to construct metronome scheme", zap.Error(err))
 		}
 		scheme = s
+		oracle = &metronomeOracle{}
+		oracle.scheme.Store(s)
+		b.config.Metronome = oracle // installs the durability commit rule
 		b.lg.Info("metronome enabled",
 			zap.Int("cluster-size", s.NumNodes()),
 			zap.Int("quorum-size", s.QuorumSize()),
@@ -656,17 +653,28 @@ func (b *bootstrappedRaft) newRaftNode(cfg config.ServerConfig, ss snap.Snapshot
 		)
 	}
 
-	// Work-stealing tunables.
+	var n raft.Node
+	if len(b.peers) == 0 {
+		n = raft.RestartNode(b.config)
+	} else {
+		n = raft.StartNode(b.config, b.peers)
+	}
+	raftStatusMu.Lock()
+	raftStatus = n.Status
+	raftStatusMu.Unlock()
+
+	// Work-stealing tunables (design spec):
+	//   - If the commit index fails to advance for the timeout (1s default,
+	//     configurable), the replica enters a "persist-everything" window.
+	//   - The window lasts wsDuration (60s default).
+	//   - After the window, the persist-set shuffling scheme resumes.
 	//
-	// Default timeout: 1s (or 10× TickMs, whichever is larger). This
-	// must be safely above typical commit-latency p99 jitter under
-	// healthy operation — otherwise a brief GC pause or network
-	// hiccup triggers WS and puts the follower in "log everything"
-	// mode for the full duration, wiping out metronome's byte
-	// savings. Real stragglers (disconnected peers, stalled disks)
-	// take seconds to become a problem; we target those.
-	//
-	// Default duration: 1 minute, matching the paper (Metronome §4.2).
+	// The timeout default is 1s (or 10× TickMs, whichever is larger) per the
+	// paper. It is CONFIGURABLE via --metronome-work-steal-timeout: for a pure
+	// no-failure benchmark, set it high (e.g. 300s) so WS never fires on a
+	// transient load stall (the apply-loop blocking + GC pauses under heavy
+	// write load can briefly stall commit) and metronome's steady-state byte
+	// savings are actually measured. Production tunes it to taste.
 	wsTimeout := cfg.MetronomeWorkStealTimeout
 	if wsTimeout <= 0 {
 		wsTimeout = 10 * time.Duration(cfg.TickMs) * time.Millisecond
@@ -679,6 +687,24 @@ func (b *bootstrappedRaft) newRaftNode(cfg config.ServerConfig, ss snap.Snapshot
 		wsDuration = time.Minute
 	}
 
+	// Express the work-steal timeout / persist-everything duration in leader
+	// ticks for the raft library's leader-driven commit-stall fallback. The
+	// leader ticks once per TickMs (HeartbeatTick=1).
+	if oracle != nil {
+		tickInterval := time.Duration(cfg.TickMs) * time.Millisecond
+		if tickInterval <= 0 {
+			tickInterval = time.Millisecond
+		}
+		oracle.stallTicks = int(wsTimeout / tickInterval)
+		if oracle.stallTicks < 1 {
+			oracle.stallTicks = 1
+		}
+		oracle.windowTicks = int(wsDuration / tickInterval)
+		if oracle.windowTicks < 1 {
+			oracle.windowTicks = 1
+		}
+	}
+
 	return newRaftNode(
 		raftNodeConfig{
 			lg:              b.lg,
@@ -689,6 +715,7 @@ func (b *bootstrappedRaft) newRaftNode(cfg config.ServerConfig, ss snap.Snapshot
 			storage:         buildRaftStorage(b.lg, wal, ss),
 			localID:         localID,
 			metronomeScheme: scheme,
+			metronome:       oracle,
 			wsTimeout:       wsTimeout,
 			wsDuration:      wsDuration,
 		},

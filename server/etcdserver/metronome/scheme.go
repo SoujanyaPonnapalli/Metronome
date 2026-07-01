@@ -28,9 +28,20 @@
 // preserved because HardState (term, vote, commit) is still persisted on
 // every node on every ready event.
 //
-// Load balancing: the persist-set rotates by one position per entry
-// index, so consecutive entries share (K-1) persisters. Over the long
-// run each node persists K/N of all entries.
+// Load balancing (distance-maximized ordering): the persist-set for an
+// entry is chosen from the C(N,K) distinct K-subsets, greedily ordered so
+// that consecutive entries' persist-sets overlap as LITTLE as possible
+// (maximum Hamming distance, ties broken toward the least-used nodes).
+// The schedule has period TotalLen = C(N,K); entry `index` uses the subset
+// at `index % TotalLen`. Over one period each node persists exactly
+// C(N-1,K-1) entries (a K/N fraction), but — crucially — no node sits on
+// the fsync critical path for a run of consecutive indices. This is the
+// "metronome" effect: it spreads the per-entry commit critical path evenly
+// across all nodes so a single node's fsync queue never stalls a long run
+// of commits, smoothing tail latency. (A naive index%N rotation, by
+// contrast, keeps K-1 of the same nodes on the critical path for N
+// consecutive indices and re-creates the very tail coupling Metronome
+// exists to break.)
 //
 // This package is pure computation — it has no side effects and does not
 // import anything from storage/WAL. Callers wire ShouldPersist() into
@@ -42,7 +53,7 @@ import (
 	"sort"
 )
 
-// Scheme is a deterministic round-robin persist-set picker. It is
+// Scheme is a deterministic distance-maximized persist-set picker. It is
 // constructed from the current cluster membership and quorum size and is
 // immutable thereafter. On membership change, callers construct a new
 // Scheme from the updated membership.
@@ -56,11 +67,23 @@ type Scheme struct {
 	// Invariant: f+1 <= quorumSize <= len(nodeIDs).
 	quorumSize int
 
-	// positionOf maps nodeID -> its position in the sorted nodeIDs slice.
-	// Precomputed at construction so ShouldPersist runs in O(1) instead
-	// of O(K) — important because ShouldPersist is called once per entry
-	// per Ready on the hot path.
+	// positionOf maps nodeID -> its position [0,N) in the sorted nodeIDs
+	// slice. Precomputed so ShouldPersist is O(1).
 	positionOf map[uint64]int
+
+	// orderedQuorums is the C(N,K) distinct K-subsets of node positions,
+	// greedily ordered to maximize the Hamming distance between consecutive
+	// subsets (see package doc). orderedQuorums[t] is a sorted K-subset of
+	// positions [0,N). totalLen == len(orderedQuorums) == C(N,K).
+	orderedQuorums [][]int
+	totalLen       int
+
+	// ordering[pos] is the per-position boolean schedule of length
+	// totalLen: ordering[pos][t] reports whether the node at `pos` persists
+	// the entry whose (index % totalLen) == t. Precomputed so ShouldPersist
+	// is a single O(1) slice index — the hot path is one bool lookup with
+	// no map probe beyond positionOf and no per-call allocation.
+	ordering [][]bool
 }
 
 // DefaultQuorumSize returns f+1 = ceil((numNodes+1)/2), the smallest
@@ -100,7 +123,30 @@ func NewScheme(nodeIDs []uint64, quorumSize int) (*Scheme, error) {
 	for i, id := range sorted {
 		pos[id] = i
 	}
-	return &Scheme{nodeIDs: sorted, quorumSize: quorumSize, positionOf: pos}, nil
+
+	// Build the distance-maximized schedule over positions [0,N). This is
+	// deterministic given (N, K) alone, so every node computes the identical
+	// ordering and therefore agrees on each index's persist-set — required
+	// for the leader's per-entry durability commit rule.
+	ordered := maximizeDistanceOrdering(positionCombinations(len(sorted), quorumSize))
+	totalLen := len(ordered)
+	ordering := make([][]bool, len(sorted))
+	for p := range ordering {
+		row := make([]bool, totalLen)
+		for t, q := range ordered {
+			row[t] = containsInt(q, p)
+		}
+		ordering[p] = row
+	}
+
+	return &Scheme{
+		nodeIDs:        sorted,
+		quorumSize:     quorumSize,
+		positionOf:     pos,
+		orderedQuorums: ordered,
+		totalLen:       totalLen,
+		ordering:       ordering,
+	}, nil
 }
 
 // NumNodes returns N.
@@ -108,6 +154,9 @@ func (s *Scheme) NumNodes() int { return len(s.nodeIDs) }
 
 // QuorumSize returns K.
 func (s *Scheme) QuorumSize() int { return s.quorumSize }
+
+// Period returns TotalLen = C(N,K), the length of the persist-set schedule.
+func (s *Scheme) Period() int { return s.totalLen }
 
 // NodeIDs returns a copy of the sorted nodeIDs.
 func (s *Scheme) NodeIDs() []uint64 {
@@ -117,43 +166,39 @@ func (s *Scheme) NodeIDs() []uint64 {
 }
 
 // PersistSet returns the K nodeIDs that should persist the entry at
-// `index`. The caller must not mutate the returned slice.
+// `index` under the distance-maximized schedule. The caller must not
+// mutate the returned slice's identity expectations (a fresh slice is
+// returned each call).
 func (s *Scheme) PersistSet(index uint64) []uint64 {
-	n := len(s.nodeIDs)
-	start := int(index % uint64(n))
-	out := make([]uint64, s.quorumSize)
-	for i := 0; i < s.quorumSize; i++ {
-		out[i] = s.nodeIDs[(start+i)%n]
+	q := s.orderedQuorums[int(index%uint64(s.totalLen))]
+	out := make([]uint64, len(q))
+	for i, pos := range q {
+		out[i] = s.nodeIDs[pos]
 	}
 	return out
 }
 
 // ShouldPersist reports whether nodeID should WAL-persist the entry at
 // `index` under this scheme. It returns false when nodeID is not a
-// member of the scheme.
-//
-// O(1): uses the precomputed positionOf map. Equivalent to "is the
-// position of nodeID within K positions ahead of (index mod N)?".
+// member of the scheme. O(1): one positionOf probe plus one bool lookup
+// in the precomputed schedule — no allocation, no scan.
 func (s *Scheme) ShouldPersist(nodeID uint64, index uint64) bool {
 	p, ok := s.positionOf[nodeID]
 	if !ok {
 		return false
 	}
-	n := uint64(len(s.nodeIDs))
-	offset := (uint64(p) + n - index%n) % n
-	return offset < uint64(s.quorumSize)
+	return s.ordering[p][int(index%uint64(s.totalLen))]
 }
 
 // ShouldFollowerPersistSnapshot reports whether nodeID — known to NOT
 // be the cluster's current leader — should locally persist the snapshot
 // at `index`. Used in the leader-always-saves snapshot scheme:
 //
-//   * The leader unconditionally saves its local snapshot (so it can
+//   - The leader unconditionally saves its local snapshot (so it can
 //     always serve InstallSnapshot to recovering peers).
-//   * The remaining (K-1) of (N-1) followers rotate at each index,
+//   - The remaining (K-1) of (N-1) followers rotate at each index,
 //     giving exactly K = f+1 cluster-wide saves per snapshot trigger
-//     (compared to N for canonical etcd, K average for the default
-//     full-rotation scheme).
+//     (compared to N for canonical etcd).
 //
 // The rotation excludes leaderID from the candidate set. If leaderID
 // isn't in the scheme (impossible in steady state but possible during
@@ -192,6 +237,108 @@ func (s *Scheme) ShouldFollowerPersistSnapshot(nodeID, leaderID, index uint64) b
 	start := int(index % uint64(m))
 	for i := 0; i < want; i++ {
 		if followers[(start+i)%m] == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+// positionCombinations returns all C(n,k) k-subsets of positions [0,n) in
+// lexicographic order. Each subset is sorted ascending.
+func positionCombinations(n, k int) [][]int {
+	var res [][]int
+	comb := make([]int, k)
+	var rec func(start, depth int)
+	rec = func(start, depth int) {
+		if depth == k {
+			t := make([]int, k)
+			copy(t, comb)
+			res = append(res, t)
+			return
+		}
+		for i := start; i < n; i++ {
+			comb[depth] = i
+			rec(i+1, depth+1)
+		}
+	}
+	rec(0, 0)
+	return res
+}
+
+// maximizeDistanceOrdering greedily reorders the k-subsets so that each
+// consecutive pair has the maximum possible Hamming distance (fewest
+// shared nodes); ties are broken toward subsets whose nodes have been used
+// the fewest times so far. Deterministic given the input order (which is
+// fixed lexicographic), so all nodes derive the identical schedule. This
+// mirrors the reference Metronome ordering.
+func maximizeDistanceOrdering(combos [][]int) [][]int {
+	if len(combos) == 0 {
+		return nil
+	}
+	remaining := make([][]int, len(combos))
+	copy(remaining, combos)
+	ordered := make([][]int, 0, len(combos))
+	ordered = append(ordered, remaining[0])
+	remaining = remaining[1:]
+
+	occ := make(map[int]int)
+	for _, node := range ordered[0] {
+		occ[node]++
+	}
+
+	for len(remaining) > 0 {
+		last := ordered[len(ordered)-1]
+		maxDist := -1
+		cand := []int{} // indices into remaining
+		for i, t := range remaining {
+			d := hammingDistance(last, t)
+			if d > maxDist {
+				maxDist = d
+				cand = []int{i}
+			} else if d == maxDist {
+				cand = append(cand, i)
+			}
+		}
+		sel := cand[0]
+		if len(cand) > 1 {
+			minOcc := int(^uint(0) >> 1)
+			for _, i := range cand {
+				o := 0
+				for _, node := range remaining[i] {
+					o += occ[node]
+				}
+				if o < minOcc { // strictly less: keeps the earliest on ties
+					minOcc = o
+					sel = i
+				}
+			}
+		}
+		chosen := remaining[sel]
+		ordered = append(ordered, chosen)
+		for _, node := range chosen {
+			occ[node]++
+		}
+		remaining = append(remaining[:sel], remaining[sel+1:]...)
+	}
+	return ordered
+}
+
+// hammingDistance returns the number of elements of a not present in b
+// (a and b are equal-length sorted subsets of the same universe, so this
+// equals k - |a ∩ b|).
+func hammingDistance(a, b []int) int {
+	dist := 0
+	for _, x := range a {
+		if !containsInt(b, x) {
+			dist++
+		}
+	}
+	return dist
+}
+
+func containsInt(s []int, x int) bool {
+	for _, v := range s {
+		if v == x {
 			return true
 		}
 	}
