@@ -1,0 +1,49 @@
+name: Workflow Test Template
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      targets:
+        required: false
+        type: string
+        default: "[]"
+permissions: read-all
+
+jobs:
+  run:
+    runs-on: ${{ inputs.runs-on }}
+    # this is to prevent arm64 jobs from running at forked projects
+    if: inputs.arch != 'arm64' || github.repository == 'etcd-io/raft'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - id: goversion
+        run: echo "goversion=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ steps.goversion.outputs.goversion }}
+      - env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          go clean -testcache
+          case "${TARGET}" in
+            linux-amd64-unit-4-cpu-race)
+              GOARCH=amd64 PASSES='unit' RACE='true' CPU='4' ./scripts/test.sh -p=2
+              ;;
+            linux-386-unit-1-cpu)
+              GOARCH=386 PASSES='unit' RACE='false' CPU='1' ./scripts/test.sh -p=4
+              ;;
+            linux-arm64-unit-4-cpu-race)
+              GOARCH=arm64 PASSES='unit' RACE='true' CPU='4' ./scripts/test.sh -p=2
+              ;;
+            *)
+              echo "Failed to find target"
+              exit 1
+              ;;
+          esac

@@ -52,6 +52,7 @@ import (
 	httptypes "go.etcd.io/etcd/server/v3/etcdserver/api/etcdhttp/types"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/membership"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/rafthttp"
+	"go.etcd.io/etcd/server/v3/etcdserver/metronome"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 	stats "go.etcd.io/etcd/server/v3/etcdserver/api/v2stats"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v2store"
@@ -240,7 +241,7 @@ type EtcdServer struct {
 
 	cluster *membership.RaftCluster
 
-	snapshotter *snap.Snapshotter
+	snapshotter snap.Snapshotter
 
 	uberApply apply.UberApplier
 
@@ -316,7 +317,7 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 		lg:                    cfg.Logger,
 		errorc:                make(chan error, 1),
 		snapshotter:           b.ss,
-		r:                     *b.raft.newRaftNode(b.ss, b.storage.wal.w, b.cluster.cl),
+		r:                     *b.raft.newRaftNode(cfg, b.ss, b.storage.wal.w, b.cluster.cl),
 		memberID:              b.cluster.nodeID,
 		attributes:            membership.Attributes{Name: cfg.Name, ClientURLs: cfg.ClientURLs.StringSlice()},
 		cluster:               b.cluster.cl,
@@ -595,6 +596,11 @@ func (s *EtcdServer) start() {
 
 func (s *EtcdServer) purgeFile() {
 	lg := s.Logger()
+	if s.Cfg.ExperimentalInMemOnly {
+		// No WAL or snap files on disk to purge.
+		<-s.stopping
+		return
+	}
 	var dberrc, serrc, werrc <-chan error
 	var dbdonec, sdonec, wdonec <-chan struct{}
 	if s.Cfg.MaxSnapFiles > 0 {
@@ -719,6 +725,22 @@ func (s *EtcdServer) Process(ctx context.Context, m raftpb.Message) error {
 	}
 	if m.Type == raftpb.MsgApp {
 		s.stats.RecvAppendReq(types.ID(m.From).String(), m.Size())
+	}
+	// Metronome recovery edge case: after a restart we discard sparse
+	// WAL entries, so our local raftLog.lastIndex() == snapshot.Index.
+	// The leader still has stale Progress.Match for us (from before
+	// the crash) and its heartbeats carry Commit == Match, which can
+	// exceed our lastIndex. raft.commitTo panics in that case. Clamp
+	// the incoming heartbeat Commit to what we actually have; the
+	// leader will correct its Progress once our first MsgAppResp
+	// arrives (either via reject-and-decrement or via MsgSnap). The
+	// same clamp applies to MsgApp's Commit for the same reason —
+	// raft accepts the MsgApp contents, then separately advances
+	// committed via commitTo, which would panic.
+	if s.Cfg.Metronome && (m.Type == raftpb.MsgHeartbeat || m.Type == raftpb.MsgApp) {
+		if lastIdx, err := s.r.raftStorage.LastIndex(); err == nil && m.Commit > lastIdx {
+			m.Commit = lastIdx
+		}
 	}
 	return s.r.Step(ctx, m)
 }
@@ -846,9 +868,48 @@ func (s *EtcdServer) run() {
 			lg.Warn("data-dir used by this member must be removed")
 			return
 		case <-s.stop:
+			// On graceful shutdown in metronome mode, drain pending
+			// applies and force a snapshot of the current applied
+			// state to disk. This leaves the node in a state where
+			// the next restart does not need to replay the sparse
+			// WAL: the snapshot + HardState on disk form a complete,
+			// self-consistent starting point, and standard raft
+			// AppendEntries fills any small gap from live peers'
+			// in-memory raft logs.
+			//
+			// Safe to skip on error-path stops (which go through
+			// <-s.errorc above) because those paths already imply
+			// the local state is untrusted.
+			if s.Cfg.Metronome {
+				sched.WaitFinish(0)
+				s.maybeForceShutdownSnapshot(&ep)
+			}
 			return
 		}
 	}
+}
+
+// maybeForceShutdownSnapshot takes a final snapshot on graceful
+// shutdown of a metronome-enabled node so that recovery on next boot
+// can start from a clean on-disk snapshot + HardState instead of a
+// sparse WAL. No-op when nothing has been applied beyond the last
+// on-disk snapshot.
+func (s *EtcdServer) maybeForceShutdownSnapshot(ep *etcdProgress) {
+	lg := s.Logger()
+	if ep.appliedi <= ep.diskSnapshotIndex {
+		lg.Info("metronome shutdown: no new applies since last disk snapshot; skipping force-snapshot",
+			zap.Uint64("applied-index", ep.appliedi),
+			zap.Uint64("disk-snapshot-index", ep.diskSnapshotIndex))
+		return
+	}
+	lg.Info("metronome shutdown: forcing final snapshot",
+		zap.Uint64("applied-index", ep.appliedi),
+		zap.Uint64("disk-snapshot-index", ep.diskSnapshotIndex))
+	// Bypass the metronome persist-set rotation: shutdown-snap is the
+	// recovery anchor, so save unconditionally even if the rotation
+	// would have us skip this index.
+	s.forceDiskSnapshot = true
+	s.snapshot(ep, true /* toDisk */)
 }
 
 func (s *EtcdServer) revokeExpiredLeases(leases []*lease.Lease) {
@@ -2055,6 +2116,16 @@ func (s *EtcdServer) applyConfChange(cc raftpb.ConfChange, confState *raftpb.Con
 			return true, nil
 		}
 		s.r.transport.RemovePeer(id)
+		// Metronome §4.5: on member removal, force surviving nodes
+		// to take a snapshot. The old scheme assigned entry i to a
+		// K-subset that included the removed member; after the
+		// change, the scheme derives a different K-subset. Snapshotting
+		// ensures that entries below the snapshot index are no longer
+		// needed from the old scheme's perspective — the snapshot
+		// itself is the quorum-persisted source of truth going forward.
+		if s.Cfg.Metronome {
+			s.forceDiskSnapshot = true
+		}
 
 	case raftpb.ConfChangeUpdateNode:
 		m := new(membership.Member)
@@ -2073,13 +2144,49 @@ func (s *EtcdServer) applyConfChange(cc raftpb.ConfChange, confState *raftpb.Con
 			s.r.transport.UpdatePeer(m.ID, m.PeerURLs)
 		}
 	}
+	// Metronome §4.5: after any membership change, rebuild the active
+	// scheme from the new member set. Done unconditionally here — the
+	// rebuild itself is a no-op when metronome is disabled.
+	s.rebuildMetronomeSchemeIfEnabled()
 	return false, nil
+}
+
+// rebuildMetronomeSchemeIfEnabled reconstructs the metronome.Scheme
+// from the current cluster membership and installs it atomically onto
+// the raft node. No-op when metronome is disabled or when the cluster
+// has fewer than 2 voting members (matching bootstrap's N=1 guard).
+func (s *EtcdServer) rebuildMetronomeSchemeIfEnabled() {
+	if !s.Cfg.Metronome {
+		return
+	}
+	// Voters only: learners aren't part of metronome's f+1 persist-set
+	// invariant (see bootstrap.go for the same rule).
+	memberIDs := s.cluster.VotingMemberIDs()
+	if len(memberIDs) < 2 {
+		return
+	}
+	ids := make([]uint64, 0, len(memberIDs))
+	for _, m := range memberIDs {
+		ids = append(ids, uint64(m))
+	}
+	k := int(s.Cfg.MetronomeQuorumSize) // 0 => default (f+1)
+	scheme, err := metronome.NewScheme(ids, k)
+	if err != nil {
+		s.Logger().Warn("metronome: failed to rebuild scheme after ConfChange; keeping previous scheme",
+			zap.Int("num-members", len(ids)),
+			zap.Error(err))
+		return
+	}
+	s.r.UpdateMetronomeScheme(scheme)
 }
 
 // TODO: non-blocking snapshot
 func (s *EtcdServer) snapshot(ep *etcdProgress, toDisk bool) {
 	lg := s.Logger()
 	d := GetMembershipInfoInV2Format(lg, s.cluster)
+	// Capture forceDiskSnapshot here so the rotation-bypass decision
+	// below sees the original value; we reset it after capturing.
+	forced := s.forceDiskSnapshot
 	if toDisk {
 		s.Logger().Info(
 			"triggering snapshot",
@@ -2087,7 +2194,7 @@ func (s *EtcdServer) snapshot(ep *etcdProgress, toDisk bool) {
 			zap.Uint64("local-member-applied-index", ep.appliedi),
 			zap.Uint64("local-member-snapshot-index", ep.diskSnapshotIndex),
 			zap.Uint64("local-member-snapshot-count", s.Cfg.SnapshotCount),
-			zap.Bool("snapshot-forced", s.forceDiskSnapshot),
+			zap.Bool("snapshot-forced", forced),
 		)
 		s.forceDiskSnapshot = false
 		// commit kv to write metadata (for example: consistent index) to disk.
@@ -2117,19 +2224,66 @@ func (s *EtcdServer) snapshot(ep *etcdProgress, toDisk bool) {
 	verifyConsistentIndexIsLatest(snap, s.consistIndex.ConsistentIndex())
 
 	if toDisk {
-		// SaveSnap saves the snapshot to file and appends the corresponding WAL entry.
-		if err = s.r.storage.SaveSnap(snap); err != nil {
-			lg.Panic("failed to save snapshot", zap.Error(err))
+		// Metronome — local snapshot rotation. Every node (leader
+		// included) consults shouldPersistSnapshot. Exactly K of N
+		// nodes save per trigger, giving optimal (N-K)/N cluster-wide
+		// snap-byte savings (33% at N=3 K=2; 43% at N=7 K=4).
+		//
+		// EXCEPTION: when s.forceDiskSnapshot is set (graceful
+		// shutdown path, or any other "this snap is the recovery
+		// anchor" caller), bypass the rotation and save
+		// unconditionally. Without this a stopping node that happens
+		// to fall outside the persist-set at shutdown time exits with
+		// no fresh anchor — and on restart the only anchor is some
+		// older snap that's K snapshot-counts back, which makes the
+		// MsgApp catch-up too long for the test's 30-second window.
+		//
+		// Why this works even when the LEADER skips its own local
+		// snap: the leader's snap-send path
+		// (createMergedSnapshotMessage in snapshot_merge.go) takes a
+		// FRESH snapshot from the live BBoltDB backend at send time
+		// (via s.be.Snapshot()) — it doesn't read from a saved
+		// .snap.db file. So the leader can always serve
+		// InstallSnapshot to a recovering follower regardless of
+		// which snap indices it chose to persist locally.
+		//
+		// A skipping node:
+		//   * skips SaveSnap (no .snap / .snap.db at this index),
+		//   * skips Release (keeps WAL retention until its own next
+		//     save anchors local recovery),
+		//   * still advances ep.diskSnapshotIndex so the next trigger
+		//     fires snapshot-count entries from THIS index.
+		persistLocally := forced ||
+			s.r.shouldPersistSnapshot(false, snap.Metadata.Index)
+		if persistLocally {
+			if err = s.r.storage.SaveSnap(snap); err != nil {
+				lg.Panic("failed to save snapshot", zap.Error(err))
+			}
+			// Only Release WAL when we actually have a local snap to
+			// anchor against. Release() also calls
+			// Snapshotter.ReleaseSnapDBs(snap) which DELETES older
+			// .snap.db files — if we Release without saving the new
+			// snap, we'd delete our backend anchor and on restart
+			// load `consistentIndex = 0`. Tested empirically: always-
+			// Release breaks TestMetronomeCrashRestart.
+			if err = s.r.storage.Release(snap); err != nil {
+				lg.Panic("failed to release wal", zap.Error(err))
+			}
+			lg.Info(
+				"saved snapshot to disk",
+				zap.Uint64("snapshot-index", snap.Metadata.Index),
+			)
+		} else {
+			// Skipping (could be leader or follower): don't SaveSnap
+			// and don't Release. Keep WAL retention until our own next
+			// save provides a local recovery anchor.
+			lg.Info(
+				"metronome: skipping local snapshot (not in persist-set)",
+				zap.Uint64("snapshot-index", snap.Metadata.Index),
+				zap.String("local-member-id", s.MemberID().String()),
+			)
 		}
 		ep.diskSnapshotIndex = ep.appliedi
-		if err = s.r.storage.Release(snap); err != nil {
-			lg.Panic("failed to release wal", zap.Error(err))
-		}
-
-		lg.Info(
-			"saved snapshot to disk",
-			zap.Uint64("snapshot-index", snap.Metadata.Index),
-		)
 	}
 }
 
